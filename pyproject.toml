@@ -1,0 +1,27 @@
+[project]
+name = "note-version-history"
+version = "1.0.0"
+description = "Anki add-on: git-like version history for notes, note types (templates/CSS) and media"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["anki", "pytest", "pytest-cov", "ruff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src/note_version_history"]
+omit = [
+    "src/note_version_history/__init__.py",
+    "src/note_version_history/scheduler.py",
+    "src/note_version_history/ui/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

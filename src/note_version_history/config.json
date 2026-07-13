@@ -1,0 +1,15 @@
+{
+    "auto_capture": true,
+    "debounce_ms": 1500,
+    "heartbeat_scan_minutes": 5,
+    "capture_media": true,
+    "media_scan_on_profile_open": true,
+    "media_scan_on_profile_close": false,
+    "retention": {
+        "max_auto_versions_per_note": 100,
+        "max_age_days": 180,
+        "media_max_age_days": 0
+    },
+    "exclude_notetype_ids": [],
+    "language": "auto"
+}

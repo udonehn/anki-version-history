@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Anki addon runtime data (per-profile history DBs) — never commit user data
+src/note_version_history/user_files/*
+!src/note_version_history/user_files/README.txt
+
+# AddonManager writes meta.json at runtime when the addon is installed/linked
+src/note_version_history/meta.json
+
+# Local-only docs (dev checklist, AnkiWeb listing draft) — not part of the public repo
+docs_local/
+
+.claude/
