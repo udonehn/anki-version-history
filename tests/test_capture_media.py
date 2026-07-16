@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
 from anki.collection import Collection
 
-from note_version_history import baseline, consts
+from note_version_history import baseline, capture_media, consts, db
 from note_version_history.blobstore import BlobStore
 from note_version_history.capture_media import (
     capture_files_for_notes,
@@ -231,3 +232,102 @@ def test_estimate_media(col, conn):
     numbers = baseline.estimate_media(col)
     assert numbers["file_count"] == 1
     assert numbers["total_bytes"] == 8
+
+
+def test_stale_state_does_not_duplicate_event(col, conn, blobs):
+    # Two scanners hash the same new file; the second write must dedupe against
+    # the manifest INSIDE its transaction, not double-log the event.
+    path = write_media(col, "a.mp3", b"payload")
+    stale_state = capture_media._read_media_state(blobs, "a.mp3", path, {})
+    assert stale_state is not None
+
+    full_scan(col, conn, blobs)  # the "other" scanner commits first
+    assert len(list_media_events(conn, "a.mp3")) == 1
+
+    added, modified = capture_media._write_media_states(
+        conn, [stale_state], consts.ORIGIN_AUTO, 1234
+    )
+    assert (added, modified) == (0, 0)
+    assert len(list_media_events(conn, "a.mp3")) == 1  # no duplicate
+
+
+def test_deletion_pass_concurrency_guards(col, conn, blobs):
+    write_media(col, "kept.png", b"kept")
+    full_scan(col, conn, blobs)
+
+    # (a) a file recorded by a concurrent targeted capture AFTER our directory
+    # listing: in the fresh manifest, missing from `seen`, but present on disk
+    late = write_media(col, "late.png", b"late")
+    capture_media.capture_named_files(conn, blobs, media_dir(col), ["late.png"])
+    deleted = capture_media._write_deletions(
+        conn, media_dir(col), seen={"kept.png"}, origin=consts.ORIGIN_AUTO, now_ms=99
+    )
+    assert deleted == 0  # on-disk re-check spares it
+    assert late.is_file()
+
+    # (b) a genuinely deleted file is tombstoned exactly once even if two
+    # passes run the deletion diff back-to-back (fresh manifest re-read)
+    (media_dir(col) / "kept.png").unlink()
+    first = capture_media._write_deletions(
+        conn, media_dir(col), seen=set(), origin=consts.ORIGIN_AUTO, now_ms=100
+    )
+    second = capture_media._write_deletions(
+        conn, media_dir(col), seen=set(), origin=consts.ORIGIN_AUTO, now_ms=101
+    )
+    assert (first, second) == (1, 0)
+    events = [e.event for e in list_media_events(conn, "kept.png")]
+    assert events.count(consts.EVENT_DELETED) == 1
+
+
+def test_restore_records_true_size_and_fails_early_without_blob(col, conn, blobs):
+    base_time = time.time() - 100
+    write_media(col, "a.mp3", b"v1", mtime=base_time)
+    full_scan(col, conn, blobs)
+    v1_sha = list_media_events(conn, "a.mp3")[0].sha1
+    write_media(col, "a.mp3", b"v2-longer-content", mtime=base_time + 50)
+    full_scan(col, conn, blobs)
+
+    restore_media_file(col, conn, blobs, "a.mp3", v1_sha)
+    latest = list_media_events(conn, "a.mp3")[0]
+    assert latest.sha1 == v1_sha
+    assert latest.size == len(b"v1")  # size measured from the streamed blob
+
+    before = conn.execute("select count(*) from media_events").fetchone()[0]
+    with pytest.raises(FileNotFoundError):
+        restore_media_file(col, conn, blobs, "a.mp3", "0" * 40)
+    after = conn.execute("select count(*) from media_events").fetchone()[0]
+    assert before == after  # missing blob fails before any row is written
+    assert (media_dir(col) / "a.mp3").read_bytes() == b"v1"  # file untouched
+
+
+def test_full_scan_stamps_last_scan_meta_only_when_completed(col, conn, blobs):
+    for index in range(4):
+        write_media(col, f"f{index}.png", f"data{index}".encode())
+    calls = {"n": 0}
+
+    def stop_after_first_chunk() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    report = full_scan(col, conn, blobs, chunk_size=2, should_stop=stop_after_first_chunk)
+    assert report.interrupted
+    assert db.meta_get(conn, consts.META_LAST_MEDIA_SCAN_MS) is None
+
+    full_scan(col, conn, blobs)
+    assert db.meta_get(conn, consts.META_LAST_MEDIA_SCAN_MS) is not None
+
+
+def test_media_keys_normalized_to_nfc(col, conn, blobs):
+    nfd_name = unicodedata.normalize("NFD", "café.png")
+    nfc_name = unicodedata.normalize("NFC", "café.png")
+    assert nfd_name != nfc_name  # sanity: the two spellings differ in bytes
+    write_media(col, nfd_name, b"img")
+
+    full_scan(col, conn, blobs)
+
+    files = [f for f, _e, _t in list_media_files(conn)]
+    assert files == [nfc_name]  # manifest/event key is the NFC spelling
+    # a targeted capture under the NFC spelling maps to the same key — no
+    # phantom second add even when the platform treats the names distinctly
+    capture_media.capture_named_files(conn, blobs, media_dir(col), [nfc_name])
+    assert len(list_media_events(conn, nfc_name)) == 1

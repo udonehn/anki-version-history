@@ -19,6 +19,12 @@ _EN = {
         "Blob store: {blob_count} files, {blob_mb:.1f} MB\n\n"
         "Database: {db_path}"
     ),
+    # shown while media capture is disabled (no media/blob lines to explain)
+    "about_body_media_off": (
+        "Note versions: {notes}\n"
+        "Note type versions: {notetypes}\n\n"
+        "Database: {db_path}"
+    ),
     "about_no_profile": "No profile is open.",
     # Errors
     "db_too_new": (
@@ -29,7 +35,11 @@ _EN = {
     # Capture pipeline
     "label_undo": "Undo: {label}",
     "label_redo": "Redo: {label}",
-    "scan_failed": "Version capture failed:\n{error}",
+    "scan_failed_repeatedly": (
+        "Version History has failed to capture changes several times in a row. "
+        "Recent edits may not be saved to history. Check that your disk isn't "
+        "full and restart Anki; if it persists, please report it."
+    ),
     # Baseline wizard
     "baseline_intro_title": "Version History — Full Baseline",
     "baseline_intro": (
@@ -73,8 +83,14 @@ _EN = {
     "hd_snapshot_now": "Add Snapshot",
     "hd_close": "Close",
     "hd_tags": "Tags",
-    "hd_deleted_banner": "This version marks the note's DELETION.",
-    "hd_note_missing_banner": "The note no longer exists in the collection.",
+    "hd_deleted_banner": (
+        "The note was deleted at this point. Its content from just before the "
+        "deletion can be brought back with 'Restore as New Note' below."
+    ),
+    "hd_note_missing_banner": (
+        "The note no longer exists in the collection. Use 'Restore as New "
+        "Note' below to bring this version's content back."
+    ),
     "origin_baseline": "Baseline",
     "origin_auto": "Auto",
     "origin_manual": "Snapshot",
@@ -84,6 +100,7 @@ _EN = {
     "@undo_delete": "Restored (undo delete)",
     "@full_rescan": "Full rescan",
     "@delete_notetype": "Deleted note type",
+    "@sync": "Sync",
     # Restore flows
     "undo_restore_note": "Restore Note Version",
     "undo_restore_as_new": "Restore Note as New",
@@ -118,7 +135,10 @@ _EN = {
     "ntd_front": "Front template",
     "ntd_back": "Back template",
     "ntd_css_tab": "CSS",
-    "ntd_deleted_banner": "This version marks the note type's DELETION.",
+    "ntd_deleted_banner": (
+        "The note type was deleted at this point. Earlier versions below "
+        "still show its templates and CSS."
+    ),
     "ntd_notetype_missing": "This note type no longer exists in the collection.",
     "ntd_restore": "Restore Templates + CSS",
     "ntd_confirm_restore": (
@@ -192,7 +212,7 @@ _EN = {
     "rescan_done": "Full rescan finished: {captured} change(s) captured.",
     "menu_compact": "Compact Database",
     "compact_progress": "Compacting version history…",
-    "compact_done": "Compacted. Removed {blobs} unreferenced blob(s).",
+    "compact_done": "Compact finished. Removed {blobs} unused stored file(s).",
 }
 
 _KO = {
@@ -210,6 +230,12 @@ _KO = {
         "블롭 저장소: {blob_count}개 파일, {blob_mb:.1f} MB\n\n"
         "데이터베이스: {db_path}"
     ),
+    # 미디어 캡처 비활성 상태에서 표시 (미디어/블롭 줄 없음)
+    "about_body_media_off": (
+        "노트 버전: {notes}\n"
+        "노트타입 버전: {notetypes}\n\n"
+        "데이터베이스: {db_path}"
+    ),
     "about_no_profile": "열려 있는 프로필이 없습니다.",
     # Errors
     "db_too_new": (
@@ -220,7 +246,11 @@ _KO = {
     # Capture pipeline
     "label_undo": "실행 취소: {label}",
     "label_redo": "다시 실행: {label}",
-    "scan_failed": "버전 캡처에 실패했습니다:\n{error}",
+    "scan_failed_repeatedly": (
+        "버전 기록이 여러 번 연속으로 변경 캡처에 실패했습니다. 최근 편집이 기록에 "
+        "저장되지 않았을 수 있습니다. 디스크 여유 공간을 확인하고 Anki를 재시작하세요. "
+        "계속되면 제보해 주세요."
+    ),
     # Baseline wizard
     "baseline_intro_title": "버전 기록 — 전체 베이스라인",
     "baseline_intro": (
@@ -261,8 +291,14 @@ _KO = {
     "hd_snapshot_now": "스냅샷 추가",
     "hd_close": "닫기",
     "hd_tags": "태그",
-    "hd_deleted_banner": "이 버전은 노트의 '삭제'를 기록한 것입니다.",
-    "hd_note_missing_banner": "이 노트는 컬렉션에 더 이상 존재하지 않습니다.",
+    "hd_deleted_banner": (
+        "이 시점에 노트가 삭제되었습니다. 삭제 직전 내용은 아래 "
+        "'새 노트로 복원'으로 되살릴 수 있습니다."
+    ),
+    "hd_note_missing_banner": (
+        "이 노트는 컬렉션에 더 이상 존재하지 않습니다. 아래 '새 노트로 복원'으로 "
+        "이 버전 내용을 되살릴 수 있습니다."
+    ),
     "origin_baseline": "베이스라인",
     "origin_auto": "자동",
     "origin_manual": "스냅샷",
@@ -272,6 +308,7 @@ _KO = {
     "@undo_delete": "삭제 취소",
     "@full_rescan": "전체 재검사",
     "@delete_notetype": "노트타입 삭제",
+    "@sync": "동기화",
     # Restore flows
     "undo_restore_note": "노트 버전 복원",
     "undo_restore_as_new": "새 노트로 복원",
@@ -301,7 +338,10 @@ _KO = {
     "ntd_front": "앞면 템플릿",
     "ntd_back": "뒷면 템플릿",
     "ntd_css_tab": "CSS",
-    "ntd_deleted_banner": "이 버전은 노트타입의 '삭제'를 기록한 것입니다.",
+    "ntd_deleted_banner": (
+        "이 시점에 노트타입이 삭제되었습니다. 아래 이전 버전들에서 당시 "
+        "템플릿·CSS 내용은 계속 볼 수 있습니다."
+    ),
     "ntd_notetype_missing": "이 노트타입은 컬렉션에 더 이상 존재하지 않습니다.",
     "ntd_restore": "템플릿+CSS 복원",
     "ntd_confirm_restore": (
@@ -372,7 +412,7 @@ _KO = {
     "rescan_done": "전체 재검사 완료: 변경 {captured}건 캡처.",
     "menu_compact": "데이터베이스 압축",
     "compact_progress": "버전 기록 압축 중…",
-    "compact_done": "압축 완료. 참조되지 않는 블롭 {blobs}개 제거.",
+    "compact_done": "압축 완료. 사용되지 않는 저장 파일 {blobs}개를 제거했습니다.",
 }
 
 STRINGS: dict[str, dict[str, str]] = {"en": _EN, "ko": _KO}

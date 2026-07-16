@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 
 import pytest
 from anki.collection import Collection
@@ -109,11 +111,18 @@ def test_media_prune_keeps_last_event_per_file(conn):
     assert remaining == 1
 
 
+def _backdate_blob(blobs: BlobStore, sha1: str, seconds: float = 7_200) -> None:
+    stale = time.time() - seconds
+    os.utime(blobs.path_for(sha1), (stale, stale))
+
+
 def test_gc_blobs_spares_manifest_and_event_references(conn, tmp_path):
     blobs = BlobStore(tmp_path / "blobs")
     kept_event = blobs.put_bytes(b"event-referenced")
     kept_manifest = blobs.put_bytes(b"manifest-referenced")
     orphan = blobs.put_bytes(b"orphan")
+    for sha1 in (kept_event, kept_manifest, orphan):
+        _backdate_blob(blobs, sha1)  # get past the freshness guard
     conn.execute(
         "INSERT INTO media_events (fname, ts, origin, event, sha1, size)"
         " VALUES ('a', 1, 'auto', 'added', ?, 1)",
@@ -128,6 +137,20 @@ def test_gc_blobs_spares_manifest_and_event_references(conn, tmp_path):
 
     assert removed == 1
     assert blobs.has(kept_event) and blobs.has(kept_manifest)
+    assert not blobs.has(orphan)
+
+
+def test_maintenance_gcs_blobs_without_media_pruning(conn, tmp_path):
+    # Default retention (media_max_age_days=0) never prunes media events; the
+    # GC must still reap old orphans (e.g. blobs left by a rolled-back capture).
+    blobs = BlobStore(tmp_path / "blobs")
+    orphan = blobs.put_bytes(b"rollback-orphan")
+    _backdate_blob(blobs, orphan)
+
+    report = prune.run_maintenance(conn, blobs, RetentionConfig(), now_ms=NOW_MS)
+
+    assert report.media_events_pruned == 0
+    assert report.blobs_removed == 1
     assert not blobs.has(orphan)
 
 

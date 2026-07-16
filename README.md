@@ -8,7 +8,8 @@ captured; browse any item's timeline with per-field diffs and restore any
 version.
 
 > History is stored **locally** per profile in the add-on's `user_files/` and is
-> **never** written into `collection.anki2`. It does not sync between devices.
+> **never** written into `collection.anki2`. The history itself does not sync —
+> each device keeps its own (changes *arriving* via sync are still captured).
 
 ## Screenshots
 
@@ -20,6 +21,9 @@ version.
 
 - **Automatic capture** — edits are captured as you make them, riding Anki's
   undo system (undo/redo are recorded too, reflog-style).
+- **Sync-aware** — changes merged in by AnkiWeb sync (edits made on your other
+  devices) are captured as well and labeled *Sync* in the timeline; after a
+  full-sync download the add-on rescans automatically to stay consistent.
 - **Lazy by default** — no forced first-run baseline. A note's "before" state is
   captured when you open it in the editor, and recorded the first time you
   change the note. You can baseline the whole collection on demand instead.
@@ -40,11 +44,8 @@ version.
 
 ## Installation
 
-- **AnkiWeb** (recommended): install code **`1237174160`** — in Anki, Tools →
-  Add-ons → Get Add-ons, and paste the code.
-- **Manual**: download the `.ankiaddon` from the
-  [Releases](https://github.com/udonehn/anki-version-history/releases) page and
-  double-click it (or drag it into Anki).
+In Anki: **Tools → Add-ons → Get Add-ons…**, then paste the code
+**`1237174160`** ([AnkiWeb page](https://ankiweb.net/shared/info/1237174160)).
 
 ## Usage
 
@@ -56,7 +57,8 @@ version.
 - **Full baseline** (optional, for complete coverage) — Tools → *Note Version
   History* → **Baseline Entire Collection…**.
 - Diff modes in each dialog: *show this version only*, *compare with current*,
-  and *compare with previous version*.
+  and *compare with previous version* (the default; your last choice is
+  remembered).
 
 ## How it works
 

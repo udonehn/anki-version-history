@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 _CHUNK_SIZE = 1024 * 1024
 _TMP_PREFIX = ".tmp-"
+# Spare unreferenced blobs / temp files younger than this: a blob written by an
+# in-flight scan is not referenced until that scan commits its event row.
+_GC_MIN_AGE_MS = 60 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,24 @@ class BlobStore:
     def read_bytes(self, sha1: str) -> bytes:
         return self.path_for(sha1).read_bytes()
 
+    def copy_to(self, sha1: str, dest: Path) -> int:
+        """Stream a stored blob to ``dest`` (temp file + os.replace), returning
+        bytes written. Avoids loading large media fully into memory. Raises
+        FileNotFoundError if the blob is gone."""
+        src = self.path_for(sha1)
+        tmp = dest.parent / f"{_TMP_PREFIX}{uuid.uuid4().hex}"
+        size = 0
+        try:
+            with open(src, "rb") as fin, open(tmp, "wb") as fout:
+                while chunk := fin.read(_CHUNK_SIZE):
+                    size += len(chunk)
+                    fout.write(chunk)
+            os.replace(tmp, dest)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return size
+
     def stats(self) -> BlobStats:
         count = 0
         total = 0
@@ -75,15 +97,28 @@ class BlobStore:
             total += blob.stat().st_size
         return BlobStats(count=count, total_bytes=total)
 
-    def gc(self, referenced: set[str]) -> int:
-        """Delete blobs whose sha1 is not referenced; also sweeps stale temp
-        files. Returns the number of files removed."""
+    def gc(
+        self,
+        referenced: set[str],
+        *,
+        min_age_ms: int = _GC_MIN_AGE_MS,
+        now_ms: int | None = None,
+    ) -> int:
+        """Delete unreferenced blobs and stale temp files, but SPARE anything
+        modified within ``min_age_ms`` — a blob written by an in-flight scan is
+        not referenced until that scan commits its event row, so reaping fresh
+        orphans would race a concurrent capture. Returns files removed."""
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
+        cutoff = now - min_age_ms
         removed = 0
         for blob in list(self._iter_blobs()):
-            if blob.name not in referenced:
-                blob.unlink(missing_ok=True)
-                removed += 1
-        for stale in self._root.glob(f"{_TMP_PREFIX}*"):
+            if blob.name in referenced or _mtime_ms(blob) > cutoff:
+                continue
+            blob.unlink(missing_ok=True)
+            removed += 1
+        for stale in list(self._iter_tmp_files()):
+            if _mtime_ms(stale) > cutoff:
+                continue
             stale.unlink(missing_ok=True)
             removed += 1
         return removed
@@ -92,8 +127,16 @@ class BlobStore:
         for shard in self._root.iterdir():
             if shard.is_dir() and len(shard.name) == 2:
                 for blob in shard.iterdir():
-                    if blob.is_file():
+                    if blob.is_file() and not blob.name.startswith(_TMP_PREFIX):
                         yield blob
+
+    def _iter_tmp_files(self):
+        # put_file writes temps at the root; _write_atomic writes them in the
+        # shard dir — sweep both.
+        yield from self._root.glob(f"{_TMP_PREFIX}*")
+        for shard in self._root.iterdir():
+            if shard.is_dir() and len(shard.name) == 2:
+                yield from shard.glob(f"{_TMP_PREFIX}*")
 
     def _write_atomic(self, sha1: str, data: bytes) -> None:
         final = self.path_for(sha1)
@@ -105,3 +148,10 @@ class BlobStore:
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
+
+
+def _mtime_ms(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return 0  # vanished mid-sweep: treat as ancient so cleanup proceeds

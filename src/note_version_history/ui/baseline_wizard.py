@@ -19,18 +19,24 @@ def maybe_show() -> None:
     rt = scheduler.runtime()
     if rt is None or mw is None or mw.col is None:
         return
-    numbers = baseline.estimate(mw.col)
     resuming = int(baseline.get_state(rt.conn).get("notes_cursor") or 0) > 0
-    text = tr(
-        "baseline_resume_prompt" if resuming else "baseline_intro",
-        notes=numbers["note_count"],
-        notetypes=numbers["notetype_count"],
-        mb=numbers["field_bytes"] / 1_000_000,
-    )
-    if not askUser(text, title=tr("baseline_intro_title")):
-        tooltip(tr("baseline_postponed"))
-        return
-    start()
+
+    def show_prompt(numbers: dict) -> None:
+        if scheduler.runtime() is None:  # profile closed while estimating
+            return
+        text = tr(
+            "baseline_resume_prompt" if resuming else "baseline_intro",
+            notes=numbers["note_count"],
+            notetypes=numbers["notetype_count"],
+            mb=numbers["field_bytes"] / 1_000_000,
+        )
+        if not askUser(text, title=tr("baseline_intro_title")):
+            tooltip(tr("baseline_postponed"))
+            return
+        start()
+
+    # the estimate sums every note's field bytes — off the main thread
+    QueryOp(parent=mw, op=lambda col: baseline.estimate(col), success=show_prompt).run_in_background()
 
 
 def start() -> None:
@@ -100,23 +106,33 @@ def maybe_media_step(*, force_prompt: bool = False) -> None:
         return
     if not scheduler.load_config().capture_media and not force_prompt:
         return
-
-    numbers = baseline.estimate_media(mw.col)
     resuming = bool(str(baseline.get_state(rt.conn).get("media_cursor") or ""))
-    prompt_key = "media_baseline_resume_prompt" if resuming else "media_baseline_prompt"
-    text = tr(
-        prompt_key,
-        count=numbers["file_count"],
-        mb=numbers["total_bytes"] / 1_000_000,
-    )
-    if not askUser(text, title=tr("baseline_intro_title")):
-        baseline.skip_media_baseline(rt.conn)
-        tooltip(tr("media_baseline_skipped"))
-        return
-    if state == baseline.STATE_SKIPPED:
-        # user re-opted in from the Tools menu
-        baseline.update_state(rt.conn, media=baseline.STATE_PENDING)
-    start_media()
+
+    def show_prompt(numbers: dict) -> None:
+        current = scheduler.runtime()
+        if current is None:  # profile closed while estimating
+            return
+        prompt_key = (
+            "media_baseline_resume_prompt" if resuming else "media_baseline_prompt"
+        )
+        text = tr(
+            prompt_key,
+            count=numbers["file_count"],
+            mb=numbers["total_bytes"] / 1_000_000,
+        )
+        if not askUser(text, title=tr("baseline_intro_title")):
+            baseline.skip_media_baseline(current.conn)
+            tooltip(tr("media_baseline_skipped"))
+            return
+        if state == baseline.STATE_SKIPPED:
+            # user re-opted in from the Tools menu
+            baseline.update_state(current.conn, media=baseline.STATE_PENDING)
+        start_media()
+
+    # the estimate stats every media file — off the main thread
+    QueryOp(
+        parent=mw, op=lambda col: baseline.estimate_media(col), success=show_prompt
+    ).run_in_background()
 
 
 def start_media() -> None:
@@ -150,6 +166,9 @@ def start_media() -> None:
         if current is not None:
             current.baseline_running = False
         tooltip(tr("media_baseline_done", count=captured))
+        # drain note/notetype edits queued while the media baseline ran (the
+        # notes-baseline success path does the same)
+        scheduler.request_scan(notes=True, notetypes=True)
 
     def on_failure(exc: BaseException) -> None:
         current = scheduler.runtime()

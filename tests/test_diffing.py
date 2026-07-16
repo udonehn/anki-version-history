@@ -122,3 +122,29 @@ def test_contiguous_tokens_merge_into_one_span():
     spans = diffing.word_diff("", "aaa bbb")
     assert kinds(spans) == [INSERT]
     assert spans[0].text == "aaa bbb"
+
+
+def test_tokenize_falls_back_to_lines_for_dense_tokens():
+    # under the char cap but far over the token cap: 1-char token soup
+    dense = "x " * (diffing.LARGE_TOKEN_COUNT + 500)
+    assert len(dense) < diffing.LARGE_CONTENT_CHARS
+    old_tokens, new_tokens = diffing._tokenize(dense, dense + "\ny")
+    assert old_tokens == dense.splitlines(keepends=True)  # line granularity
+    assert new_tokens == (dense + "\ny").splitlines(keepends=True)
+
+    # small content keeps word granularity
+    words_old, words_new = diffing._tokenize("hello world", "hello brave world")
+    assert words_old == ["hello", " ", "world"]
+
+
+def test_word_diff_dense_content_stays_correct_via_line_fallback():
+    dense = "x " * (diffing.LARGE_TOKEN_COUNT + 500)
+    old = dense + "\nshared tail"
+    new = dense + "\nshared tail\nnew line"
+
+    spans = diffing.word_diff(old, new)
+
+    reconstructed_old = "".join(s.text for s in spans if s.kind != diffing.INSERT)
+    reconstructed_new = "".join(s.text for s in spans if s.kind != diffing.DELETE)
+    assert reconstructed_old == old
+    assert reconstructed_new == new

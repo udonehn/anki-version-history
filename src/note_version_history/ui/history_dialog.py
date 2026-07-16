@@ -22,13 +22,18 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, chooseList, tooltip
 
-from .. import capture_notes, diffing, scheduler
+from .. import capture_notes, consts, db, diffing, scheduler
 from ..i18n import tr
 from ..records import NoteVersion
 from . import actions, widgets
 
 # Non-modal dialogs need a Python-side reference or Qt's wrapper may be GC'd.
 _open_dialogs: set["HistoryDialog"] = set()
+
+# Compare-mode combo, index-aligned stable keys. The last choice is persisted
+# in the profile's history DB (meta) so reopening the dialog restores it.
+_MODE_KEYS = ("view_only", "vs_current", "vs_previous")
+_DEFAULT_MODE_KEY = "vs_previous"
 
 
 def open_for_note(parent, nid: int) -> None:
@@ -55,6 +60,8 @@ class HistoryDialog(QDialog):
             self.setWindowModality(Qt.WindowModality.WindowModal)
         self._build_ui()
         self._reload()
+        # reject() (Esc) bypasses closeEvent; finished covers every close path
+        qconnect(self.finished, lambda _result: _open_dialogs.discard(self))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         _open_dialogs.discard(self)
@@ -76,11 +83,14 @@ class HistoryDialog(QDialog):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         self._mode = QComboBox()
-        # index 0 = view only (default), 1 = vs current, 2 = vs previous
+        # index 0 = view only, 1 = vs current, 2 = vs previous (_MODE_KEYS)
         self._mode.addItems(
             [tr("hd_view_only"), tr("hd_diff_vs_current"), tr("hd_diff_vs_previous")]
         )
-        qconnect(self._mode.currentIndexChanged, lambda _idx: self._render())
+        # restore the persisted choice BEFORE wiring the signal, so the
+        # programmatic init neither re-renders nor re-saves
+        self._mode.setCurrentIndex(_saved_mode_index())
+        qconnect(self._mode.currentIndexChanged, self._on_mode_changed)
         right_layout.addWidget(self._mode)
 
         self._scroll = QScrollArea()
@@ -109,6 +119,14 @@ class HistoryDialog(QDialog):
         qconnect(close_button.clicked, self.close)
         buttons.addWidget(close_button)
         root.addLayout(buttons)
+
+    def _on_mode_changed(self, index: int) -> None:
+        rt = scheduler.runtime()
+        if rt is not None and 0 <= index < len(_MODE_KEYS):
+            db.meta_set(
+                rt.conn, consts.META_UI_HISTORY_COMPARE_MODE, _MODE_KEYS[index]
+            )
+        self._render()
 
     # --- data ---
 
@@ -142,11 +160,12 @@ class HistoryDialog(QDialog):
             return None
         return {name: note[name] for name in note.keys()}
 
-    def _base_fields(self, _version: NoteVersion) -> dict[str, str]:
+    def _base_fields(self, live: dict[str, str] | None) -> dict[str, str]:
         """What the diff compares against (current note or previous version).
-        View-only mode never calls this."""
+        ``live`` is the already-fetched live-note mapping (one fetch per
+        render). View-only mode never calls this."""
         if self._mode.currentIndex() == 1:  # vs current
-            return self._live_fields() or {}
+            return live or {}
         row = self._list.currentRow()  # vs previous
         if 0 <= row < len(self._versions) - 1:
             previous = self._versions[row + 1]
@@ -169,7 +188,8 @@ class HistoryDialog(QDialog):
         self._scroll.setWidget(container)
 
     def _render_version(self, layout: QVBoxLayout, version: NoteVersion) -> None:
-        live_exists = self._live_fields() is not None
+        live = self._live_fields()  # single fetch per render
+        live_exists = live is not None
         deleted_flow = version.deleted or not live_exists
         if version.deleted:
             layout.addWidget(_banner(tr("hd_deleted_banner")))
@@ -185,7 +205,7 @@ class HistoryDialog(QDialog):
 
         view_only = self._mode.currentIndex() == 0
         insert_style, delete_style = widgets.diff_styles()
-        base = {} if view_only else self._base_fields(version)
+        base = {} if view_only else self._base_fields(live)
         for name, value in zip(version.field_names, version.fields):
             check = QCheckBox(name)
             # view-only has no diff to flag changes → offer all fields for restore
@@ -204,7 +224,10 @@ class HistoryDialog(QDialog):
                 )
             view.setMaximumHeight(170)
             layout.addWidget(view)
-        layout.addWidget(QLabel(f"{tr('hd_tags')}: {' '.join(version.tags)}"))
+        tags_label = QLabel(f"{tr('hd_tags')}: {' '.join(version.tags)}")
+        # tags are user data; QLabel auto-detects rich text, so force plain
+        tags_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(tags_label)
 
     # --- actions ---
 
@@ -252,7 +275,22 @@ class HistoryDialog(QDialog):
         self._reload()
 
 
+def _saved_mode_index() -> int:
+    """The persisted compare-mode combo index; 'vs previous' for fresh
+    profiles (and for stored values from a future/unknown version)."""
+    key = _DEFAULT_MODE_KEY
+    rt = scheduler.runtime()
+    if rt is not None:
+        stored = db.meta_get(rt.conn, consts.META_UI_HISTORY_COMPARE_MODE)
+        if stored in _MODE_KEYS:
+            key = stored
+    return _MODE_KEYS.index(key)
+
+
 def _banner(text: str) -> QLabel:
     label = QLabel(text)
     label.setStyleSheet("color:#cc3333;font-weight:bold;")
+    # banner text is a full sentence and varies by language — wrap instead of
+    # stretching the dialog to fit it on one line
+    label.setWordWrap(True)
     return label

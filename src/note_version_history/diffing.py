@@ -14,6 +14,10 @@ from dataclasses import dataclass
 
 # Above this size, word-level diffing gets quadratic-slow; fall back to lines.
 LARGE_CONTENT_CHARS = 50_000
+# SequenceMatcher cost scales with TOKEN count, and autojunk is off (it would
+# mis-drop legitimate repeated words) — so dense token soup below the char cap
+# (e.g. tens of thousands of 1-char tokens) must also fall back to lines.
+LARGE_TOKEN_COUNT = 6_000
 
 EQUAL = "equal"
 INSERT = "insert"
@@ -32,14 +36,8 @@ class DiffSpan:
 
 def word_diff(old: str, new: str) -> list[DiffSpan]:
     """Token-level diff spans from old → new (falls back to line-level for
-    very large content)."""
-    if max(len(old), len(new)) > LARGE_CONTENT_CHARS:
-        old_tokens = old.splitlines(keepends=True)
-        new_tokens = new.splitlines(keepends=True)
-    else:
-        old_tokens = _TOKEN_RE.findall(old)
-        new_tokens = _TOKEN_RE.findall(new)
-
+    very large or very token-dense content — see :func:`_tokenize`)."""
+    old_tokens, new_tokens = _tokenize(old, new)
     matcher = difflib.SequenceMatcher(a=old_tokens, b=new_tokens, autojunk=False)
     spans: list[DiffSpan] = []
     for tag, a_start, a_end, b_start, b_end in matcher.get_opcodes():
@@ -122,6 +120,19 @@ def unified_to_html(
             rendered.append(escaped)
     body = "<br>".join(rendered)
     return f'<div style="font-family:monospace;white-space:pre;">{body}</div>'
+
+
+def _tokenize(old: str, new: str) -> tuple[list[str], list[str]]:
+    """Pick the diff granularity: word tokens normally, whole lines when the
+    content is too big (chars) or too dense (token count) for the quadratic
+    matcher to stay interactive on the UI thread."""
+    if max(len(old), len(new)) > LARGE_CONTENT_CHARS:
+        return old.splitlines(keepends=True), new.splitlines(keepends=True)
+    old_tokens = _TOKEN_RE.findall(old)
+    new_tokens = _TOKEN_RE.findall(new)
+    if max(len(old_tokens), len(new_tokens)) > LARGE_TOKEN_COUNT:
+        return old.splitlines(keepends=True), new.splitlines(keepends=True)
+    return old_tokens, new_tokens
 
 
 def _append(spans: list[DiffSpan], kind: str, text: str) -> None:

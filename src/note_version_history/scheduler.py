@@ -43,7 +43,9 @@ from .capture_notes import NoteScanContext
 
 _RESCAN_DELAY_MS = 200
 _INITIAL_SCAN_DELAY_MS = 1500
+_SYNC_SCAN_DELAY_MS = 300
 _BEFORE_CACHE_MAX = 512
+_MAX_SCAN_FAILURES = 3
 
 
 @dataclass
@@ -54,6 +56,8 @@ class PendingWork:
     saw_undo: bool = False
     want_notes: bool = False
     want_notetypes: bool = False
+    force_deletion_diff: bool = False
+    recheck_nids: frozenset[int] = frozenset()
 
     def consume(self) -> "PendingWork":
         taken = PendingWork(
@@ -61,11 +65,15 @@ class PendingWork:
             saw_undo=self.saw_undo,
             want_notes=self.want_notes,
             want_notetypes=self.want_notetypes,
+            force_deletion_diff=self.force_deletion_diff,
+            recheck_nids=self.recheck_nids,
         )
         self.labels.clear()
         self.saw_undo = False
         self.want_notes = False
         self.want_notetypes = False
+        self.force_deletion_diff = False
+        self.recheck_nids = frozenset()
         return taken
 
 
@@ -87,6 +95,17 @@ class Runtime:
     rescan_requested: bool = False
     prev_undo_status: object = None
     baseline_running: bool = False
+    # full rescan queued behind a running scan/baseline (single-flight)
+    full_rescan_pending: bool = False
+    pending_rescan_done: object = None
+    media_scan_running: bool = False
+    # sync coordination
+    sync_active: bool = False
+    full_sync_seen: bool = False
+    pre_sync_usn: int = -1
+    # repeated-failure surfacing
+    scan_failures: int = 0
+    scan_warning_shown: bool = False
 
 
 _runtime: Runtime | None = None
@@ -108,9 +127,33 @@ def profile_db_path(rt: Runtime) -> Path:
     return profiles.history_db_path(rt.data_dir)
 
 
+_config_cache: AddonConfig | None = None
+
+
 def load_config() -> AddonConfig:
-    raw = mw.addonManager.getConfig(__name__) if mw is not None else None
-    return config_from_dict(raw)
+    """The add-on config, cached: ``getConfig`` re-parses meta.json from disk on
+    every call and this runs on every note-relevant operation. Invalidated via
+    ``setConfigUpdatedAction`` when Anki's config editor saves."""
+    global _config_cache
+    if _config_cache is None:
+        raw = mw.addonManager.getConfig(__name__) if mw is not None else None
+        _config_cache = config_from_dict(raw)
+    return _config_cache
+
+
+def _on_config_updated(_new_config: object) -> None:
+    """Config editor saved: drop the cache and re-apply settings that would
+    otherwise only take effect on the next profile open."""
+    global _config_cache
+    _config_cache = None
+    apply_language()
+    rt = _runtime
+    if rt is None:
+        return
+    config = load_config()
+    rt.heartbeat.stop()
+    if config.heartbeat_scan_minutes > 0 and not rt.sync_active:
+        rt.heartbeat.start(config.heartbeat_scan_minutes * 60_000)
 
 
 def apply_language() -> None:
@@ -125,6 +168,10 @@ def setup() -> None:
     gui_hooks.profile_will_close.append(_on_profile_close)
     gui_hooks.operation_did_execute.append(_on_operation_did_execute)
     gui_hooks.editor_did_load_note.append(_on_editor_load_note)
+    gui_hooks.sync_will_start.append(_on_sync_will_start)
+    gui_hooks.sync_did_finish.append(_on_sync_did_finish)
+    gui_hooks.collection_will_temporarily_close.append(_on_collection_will_temporarily_close)
+    mw.addonManager.setConfigUpdatedAction(__name__, _on_config_updated)
 
 
 def request_scan(*, notes: bool = False, notetypes: bool = False, delay_ms: int = 300) -> None:
@@ -138,13 +185,23 @@ def request_scan(*, notes: bool = False, notetypes: bool = False, delay_ms: int 
 
 
 def request_full_rescan(on_done=None) -> bool:
-    """Background heal: hash-compare every note, run the deletion diff, reset
-    the marker (see capture_notes.full_rescan). Menu + unclean-shutdown path."""
+    """Background heal for marker regression / unclean shutdown. For a baselined
+    collection this hash-compares every note and resets the marker
+    (:func:`capture_notes.full_rescan`); for a lazy install (no baseline) it
+    re-checks only tracked notes and re-anchors the marker
+    (:func:`capture_notes.rescan_indexed`), never dumping the whole collection.
+
+    Participates in the single-flight scan gate: if a scan or baseline is already
+    running, it is queued and started when that one finishes."""
     rt = _runtime
     if rt is None or mw is None or mw.col is None:
         return False
-    if not baseline.notes_baseline_done(rt.conn):
-        return False
+    if rt.scan_running or rt.baseline_running or rt.full_rescan_pending:
+        rt.full_rescan_pending = True
+        rt.pending_rescan_done = on_done
+        return True
+    rt.scan_running = True
+    baselined = baseline.notes_baseline_done(rt.conn)
     db_path = profile_db_path(rt)
 
     def report_progress(done: int, total: int) -> None:
@@ -159,7 +216,10 @@ def request_full_rescan(on_done=None) -> bool:
     def op(col):
         own = db.open_history_db(db_path)
         try:
-            note_report = capture_notes.full_rescan(col, own, progress=report_progress)
+            if baselined:
+                note_report = capture_notes.full_rescan(col, own, progress=report_progress)
+            else:
+                note_report = capture_notes.rescan_indexed(col, own)
             capture_notetypes.scan_notetypes(col, own)
             return note_report
         finally:
@@ -168,12 +228,21 @@ def request_full_rescan(on_done=None) -> bool:
     def on_success(report) -> None:
         current = _runtime
         if current is not None:
-            current.session_touched.update(report.touched_nids)
+            current.scan_running = False
+            current.scan_failures = 0
+            # NB: deliberately NOT folding report.touched_nids into
+            # session_touched — a full rescan touches the whole collection, which
+            # would make every later undo re-check everything.
         if on_done is not None:
             on_done(report)
+        _drain_pending_scan()
 
     def on_failure(exc: BaseException) -> None:
-        print(f"note_version_history: full rescan failed: {exc!r}")
+        current = _runtime
+        if current is not None:
+            current.scan_running = False
+        _note_scan_failure(exc, "full rescan")
+        _drain_pending_scan()
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).with_progress(
         i18n.tr("rescan_progress")
@@ -190,10 +259,13 @@ def request_media_scan(on_done=None) -> bool:
         return False
     if rt is None or mw is None or mw.col is None:
         return False
+    if rt.baseline_running or rt.media_scan_running:
+        return False  # a baseline or another media scan owns the media DB now
     if baseline.media_baseline_state(rt.conn) != baseline.STATE_DONE:
         return False
     db_path = profile_db_path(rt)
     blobs_root = profiles.blobs_dir(rt.data_dir)
+    rt.media_scan_running = True
 
     def op(col):
         own = db.open_history_db(db_path)
@@ -203,10 +275,16 @@ def request_media_scan(on_done=None) -> bool:
             own.close()
 
     def on_success(report) -> None:
+        current = _runtime
+        if current is not None:
+            current.media_scan_running = False
         if on_done is not None:
             on_done(report)
 
     def on_failure(exc: BaseException) -> None:
+        current = _runtime
+        if current is not None:
+            current.media_scan_running = False
         print(f"note_version_history: media scan failed: {exc!r}")
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).run_in_background()
@@ -253,10 +331,7 @@ def _on_profile_open() -> None:
         heartbeat=heartbeat,
     )
     _runtime.prev_undo_status = _safe_undo_status()
-    if unclean and baseline.notes_baseline_done(conn):
-        # A previous session died mid-flight: schedule the heal path once the
-        # UI settles (full rescan hash-compares everything and resets the marker).
-        QTimer.singleShot(3_000, lambda: request_full_rescan())
+    unclean_heal = unclean and baseline.notes_baseline_done(conn)
 
     if config.heartbeat_scan_minutes > 0:
         heartbeat.start(config.heartbeat_scan_minutes * 60_000)
@@ -267,17 +342,32 @@ def _on_profile_open() -> None:
     # cache. Later opens do a catch-up scan for changes made while away.
     if fresh and mw.col is not None:
         _init_lazy_install(_runtime.conn)
+    elif unclean_heal:
+        # A previous session died mid-flight: the full rescan hash-compares
+        # everything and resets the marker, subsuming the catch-up scan — so
+        # schedule ONLY it (both on the same connection would otherwise race).
+        QTimer.singleShot(3_000, lambda: request_full_rescan())
     else:
         request_scan(notes=True, notetypes=True, delay_ms=_INITIAL_SCAN_DELAY_MS)
     if (
         config.capture_media
         and config.media_scan_on_profile_open
         and baseline.media_baseline_state(_runtime.conn) == baseline.STATE_DONE
+        and _media_scan_stale(_runtime.conn)
     ):
         request_media_scan()
     from .ui import baseline_wizard  # lazy: avoids import cycle
 
     baseline_wizard.maybe_media_step()  # resume a pending media baseline only
+
+
+def _media_scan_stale(conn: sqlite3.Connection) -> bool:
+    """Throttle the profile-open full media scan: a whole-folder stat pass on
+    every open is wasted work when profiles are switched often. Manual scans
+    (media dialog) bypass this."""
+    last = db.meta_get_int(conn, consts.META_LAST_MEDIA_SCAN_MS, 0)
+    now = int(time.time() * 1000)
+    return now - last >= consts.MEDIA_SCAN_MIN_INTERVAL_MS
 
 
 def _init_lazy_install(conn: sqlite3.Connection) -> None:
@@ -340,15 +430,15 @@ def _final_scan_on_close(rt: Runtime) -> None:
         capture_notetypes.scan_notetypes(mw.col, rt.conn, op_label=ctx.op_label)
         if consts.MEDIA_ENABLED and config.capture_media:
             capture_media.capture_files_for_notes(
-                mw.col, rt.conn, rt.blobs, report.touched_nids, op_label=ctx.op_label
+                mw.col, rt.conn, rt.blobs, report.touched_nids
             )
             if (
                 config.media_scan_on_profile_close
                 and baseline.media_baseline_state(rt.conn) == baseline.STATE_DONE
             ):
                 capture_media.full_scan(mw.col, rt.conn, rt.blobs)
-    except Exception:
-        pass
+    except Exception as exc:  # must never block shutdown, but leave a trace
+        print(f"note_version_history: final scan on close failed: {exc!r}")
 
 
 # --- capture hooks ---
@@ -442,6 +532,79 @@ def _safe_undo_status():
     return None
 
 
+# --- sync coordination ---
+
+
+def _on_sync_will_start() -> None:
+    """Pause capture and record the pre-sync usn high-water so the post-sync
+    hook can find exactly the notes this sync round changed."""
+    rt = _runtime
+    if rt is None or mw is None or mw.col is None:
+        return
+    rt.sync_active = True
+    rt.debounce.stop()
+    rt.heartbeat.stop()
+    rt.pre_sync_usn = _max_note_usn()
+
+
+def _on_collection_will_temporarily_close(_col) -> None:
+    """Fires when the collection is closed for a FULL sync (upload/download) —
+    the signal for a whole-collection replacement that may rewind mods."""
+    rt = _runtime
+    if rt is not None:
+        rt.full_sync_seen = True
+
+
+def _on_sync_did_finish() -> None:
+    rt = _runtime
+    if rt is None or mw is None or mw.col is None:
+        return
+    rt.sync_active = False
+    config = load_config()
+    if config.heartbeat_scan_minutes > 0:
+        rt.heartbeat.start(config.heartbeat_scan_minutes * 60_000)
+    full_sync = rt.full_sync_seen
+    rt.full_sync_seen = False
+    pre_usn = rt.pre_sync_usn
+    rt.pre_sync_usn = -1
+    if not config.auto_capture:
+        return
+    # A full download can rewind mods below our marker (blinding the incremental
+    # scan); heal with a full/indexed rescan. marker_regressed also covers the
+    # case where collection_will_temporarily_close didn't fire.
+    if full_sync or capture_notes.marker_regressed(mw.col, rt.conn):
+        request_full_rescan()
+        return
+    # Normal merge: sync-changed notes carry a fresh server usn but may keep a
+    # mod below our marker; drive exactly those through the usn-window recheck.
+    changed = _notes_changed_since_usn(pre_usn)
+    if changed:
+        rt.pending.want_notes = True
+        rt.pending.recheck_nids |= changed
+    rt.pending.want_notetypes = True
+    rt.pending.force_deletion_diff = True  # sync may delete notes at net-zero count
+    # rows captured by this scan show "Sync" in the timeline, not "Auto"
+    rt.pending.labels.append(consts.LABEL_SYNC)
+    rt.debounce.start(_SYNC_SCAN_DELAY_MS)
+
+
+def _max_note_usn() -> int:
+    try:
+        return int(mw.col.db.scalar("select coalesce(max(usn), 0) from notes"))
+    except Exception:
+        return -1
+
+
+def _notes_changed_since_usn(pre_usn: int) -> frozenset[int]:
+    if pre_usn < 0 or mw is None or mw.col is None:
+        return frozenset()
+    try:
+        rows = mw.col.db.list("select id from notes where usn > ?", pre_usn)
+    except Exception:
+        return frozenset()
+    return frozenset(int(nid) for nid in rows)
+
+
 # --- scan orchestration ---
 
 
@@ -463,10 +626,19 @@ def _start_scan() -> None:
     rt = _runtime
     if rt is None or mw is None or mw.col is None:
         return
+    if rt.sync_active:
+        return  # collection may be mid close/reopen for sync; pending is kept
     if rt.baseline_running:
         return  # a full baseline is running; let it own capture
     if rt.scan_running:
         rt.rescan_requested = True
+        return
+    if rt.full_rescan_pending:
+        # a heal queued behind a scan/baseline that has since ended runs first
+        rt.full_rescan_pending = False
+        done = rt.pending_rescan_done
+        rt.pending_rescan_done = None
+        request_full_rescan(done)
         return
     config = load_config()
     work = rt.pending.consume()
@@ -492,7 +664,6 @@ def _start_scan() -> None:
                     own,
                     BlobStore(blobs_root),
                     note_report.touched_nids,
-                    op_label=ctx.op_label,
                 )
             if prune.maintenance_due(own):
                 prune.run_maintenance(own, BlobStore(blobs_root), config.retention)
@@ -505,18 +676,48 @@ def _start_scan() -> None:
         if current is None:
             return
         current.scan_running = False
+        current.scan_failures = 0
         current.session_touched.update(report.touched_nids)
-        if current.rescan_requested:
-            current.rescan_requested = False
-            current.debounce.start(_RESCAN_DELAY_MS)
+        _drain_pending_scan()
 
     def on_failure(exc: BaseException) -> None:
         current = _runtime
         if current is not None:
             current.scan_running = False
-        print(f"note_version_history: scan failed: {exc!r}")
+        _note_scan_failure(exc)
+        _drain_pending_scan()
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).run_in_background()
+
+
+def _drain_pending_scan() -> None:
+    """Start whatever was queued behind the scan that just finished — a pending
+    full rescan wins over a plain re-scan request."""
+    rt = _runtime
+    if rt is None:
+        return
+    if rt.full_rescan_pending:
+        rt.full_rescan_pending = False
+        done = rt.pending_rescan_done
+        rt.pending_rescan_done = None
+        request_full_rescan(done)
+        return
+    if rt.rescan_requested:
+        rt.rescan_requested = False
+        rt.debounce.start(_RESCAN_DELAY_MS)
+
+
+def _note_scan_failure(exc: BaseException, what: str = "scan") -> None:
+    """Log a background-scan failure and, after several in a row, warn once per
+    session so a persistent fault (disk full, locked DB) isn't silent."""
+    print(f"note_version_history: {what} failed: {exc!r}")
+    rt = _runtime
+    if rt is None:
+        return
+    rt.scan_failures += 1
+    if rt.scan_failures >= _MAX_SCAN_FAILURES and not rt.scan_warning_shown:
+        rt.scan_warning_shown = True
+        _show_warning(i18n.tr("scan_failed_repeatedly"))
 
 
 def _build_context(rt: Runtime, work: PendingWork, config: AddonConfig) -> NoteScanContext:
@@ -527,6 +728,8 @@ def _build_context(rt: Runtime, work: PendingWork, config: AddonConfig) -> NoteS
         session_touched_nids=frozenset(rt.session_touched),
         exclude_mids=frozenset(config.exclude_notetype_ids),
         before_states=dict(rt.before_cache),  # snapshot for the background scan
+        force_deletion_diff=work.force_deletion_diff,
+        recheck_nids=work.recheck_nids,
     )
 
 
@@ -536,6 +739,10 @@ def _format_label(labels: list[str]) -> str:
         return ""
     if len(unique) == 1:
         return unique[0]
+    if unique[-1].startswith("@"):
+        # "@" sentinels are translated at display time by exact key — a
+        # " (+N)" suffix would break the lookup and leak the raw sentinel
+        return unique[-1]
     return f"{unique[-1]} (+{len(unique) - 1})"
 
 

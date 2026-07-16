@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 
 import pytest
 
@@ -48,12 +50,56 @@ def test_gc_removes_only_unreferenced(store):
     drop1 = store.put_bytes(b"drop-1")
     drop2 = store.put_bytes(b"drop-2")
 
-    removed = store.gc(referenced={keep})
+    # min_age_ms=0 disables the freshness guard so this pins pure ref-diffing
+    removed = store.gc(referenced={keep}, min_age_ms=0)
 
     assert removed == 2
     assert store.has(keep)
     assert not store.has(drop1)
     assert not store.has(drop2)
+
+
+def _backdate(path, seconds: float = 7_200) -> None:
+    stale = time.time() - seconds
+    os.utime(path, (stale, stale))
+
+
+def test_gc_age_guard_spares_fresh_orphans_and_sweeps_stale_tmps(store):
+    fresh_orphan = store.put_bytes(b"fresh-orphan")  # in-flight scan's blob
+    old_orphan = store.put_bytes(b"old-orphan")
+    _backdate(store.path_for(old_orphan))
+    root = store.path_for(old_orphan).parent.parent
+    shard_dir = store.path_for(old_orphan).parent
+    fresh_tmp = root / ".tmp-fresh"
+    fresh_tmp.write_bytes(b"x")
+    old_root_tmp = root / ".tmp-old-root"
+    old_root_tmp.write_bytes(b"x")
+    _backdate(old_root_tmp)
+    old_shard_tmp = shard_dir / ".tmp-old-shard"
+    old_shard_tmp.write_bytes(b"x")
+    _backdate(old_shard_tmp)
+
+    removed = store.gc(referenced=set())  # default one-hour age guard
+
+    assert removed == 3  # old orphan + both stale tmps
+    assert store.has(fresh_orphan)  # young blob spared (event may commit soon)
+    assert not store.has(old_orphan)
+    assert fresh_tmp.exists()
+    assert not old_root_tmp.exists()
+    assert not old_shard_tmp.exists()
+
+
+def test_copy_to_streams_blob(store, tmp_path):
+    sha1 = store.put_bytes(b"stream-me")
+    dest = tmp_path / "restored.bin"
+
+    size = store.copy_to(sha1, dest)
+
+    assert size == len(b"stream-me")
+    assert dest.read_bytes() == b"stream-me"
+    with pytest.raises(FileNotFoundError):
+        store.copy_to("0" * 40, tmp_path / "never-written.bin")
+    assert not (tmp_path / "never-written.bin").exists()
 
 
 def test_stats_empty(store):

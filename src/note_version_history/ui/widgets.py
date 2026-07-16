@@ -8,15 +8,32 @@ from datetime import datetime
 from aqt.qt import QLabel, QListWidget, QListWidgetItem, Qt, QTextBrowser
 from aqt.theme import theme_manager
 
+from .. import consts
 from ..i18n import display_label, tr
 from ..records import NoteVersion
 
+# NB: U+FE0F (emoji variation selector) forces color-emoji rendering for
+# code points that default to monochrome text glyphs (⏱ ↩ 🗑) — without it
+# rows mix colored and grey icons depending on the platform font.
 _ORIGIN_ICONS = {
     "baseline": "🏁",
-    "auto": "⏱",
+    "auto": "⏱️",
     "manual": "📌",
-    "restore": "↩",
+    "restore": "↩️",
 }
+_DELETED_ICON = "🗑️"
+_SYNC_ICON = "🔄"
+
+
+def row_icon(version) -> str:
+    """Timeline row icon for a note or notetype version (duck-typed: needs
+    ``deleted``, ``op_label``, ``origin``). Event-specific icons (deletion,
+    sync) win over the plain origin icon so the icon column is scannable."""
+    if version.deleted:
+        return _DELETED_ICON
+    if version.op_label == consts.LABEL_SYNC:
+        return _SYNC_ICON
+    return _ORIGIN_ICONS.get(version.origin, "•")
 
 
 class NoLoadTextBrowser(QTextBrowser):
@@ -52,11 +69,10 @@ def format_timestamp(ts_ms: int) -> str:
 
 def timeline_lines(version: NoteVersion) -> tuple[str, str]:
     """(time line, label line) for a note-version timeline row."""
-    icon = _ORIGIN_ICONS.get(version.origin, "•")
     label = display_label(version.op_label, version.origin)
     if version.deleted:
         label = f"{label} {tr('ntd_deleted_suffix')}"
-    return f"{icon} {format_timestamp(version.ts)}", label
+    return f"{row_icon(version)} {format_timestamp(version.ts)}", label
 
 
 def add_two_line_item(

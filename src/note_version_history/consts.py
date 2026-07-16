@@ -30,6 +30,7 @@ LABEL_DELETE_NOTE = "@delete_note"
 LABEL_UNDO_DELETE = "@undo_delete"
 LABEL_FULL_RESCAN = "@full_rescan"
 LABEL_DELETE_NOTETYPE = "@delete_notetype"
+LABEL_SYNC = "@sync"
 
 # meta table keys
 META_SCHEMA_VERSION = "schema_version"
@@ -37,11 +38,16 @@ META_PROFILE_NAME = "profile_name"
 META_BASELINE_STATE = "baseline_state"
 META_NOTE_SCAN_MARKER = "note_scan_marker"
 META_LAST_NOTE_COUNT = "last_note_count"
-META_LAST_UNDO_STATUS = "last_undo_status"
 META_LAST_PRUNE_MS = "last_prune_ms"
 META_LAST_MEDIA_SCAN_MS = "last_media_scan_ms"
 META_CLEAN_SHUTDOWN = "clean_shutdown"
-META_COL_MTIME_SEEN = "col_mtime_seen"
+# UI state (persisted per profile): history dialog compare-mode combo —
+# one of "view_only" | "vs_current" | "vs_previous"
+META_UI_HISTORY_COMPARE_MODE = "ui_history_compare_mode"
+
+# Skip the automatic profile-open media full scan if one completed this recently
+# (manual scans from the media dialog are never throttled).
+MEDIA_SCAN_MIN_INTERVAL_MS = 60 * 60 * 1000
 
 
 class RestoreInitiator:

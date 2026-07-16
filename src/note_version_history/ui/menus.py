@@ -271,29 +271,50 @@ def _open_from_editor(editor) -> None:
 
 
 def show_about() -> None:
+    from aqt.operations import QueryOp
+
+    from .. import db
+
     rt = scheduler.runtime()
     if rt is None:
         showInfo(tr("about_no_profile"), title=tr("about_title"))
         return
-    counts = {
-        "notes": _count(rt, "note_versions"),
-        "notetypes": _count(rt, "notetype_versions"),
-        "media": _count(rt, "media_events"),
-    }
-    blob_stats = rt.blobs.stats()
-    showInfo(
-        tr(
-            "about_body",
-            notes=counts["notes"],
-            notetypes=counts["notetypes"],
-            media=counts["media"],
-            blob_count=blob_stats.count,
-            blob_mb=blob_stats.total_bytes / 1_000_000,
-            db_path=str(rt.data_dir),
-        ),
-        title=tr("about_title"),
-    )
+    db_path = scheduler.profile_db_path(rt)
+    blobs = rt.blobs
+    data_dir = rt.data_dir
 
+    def op(_col):
+        # row counts + a full blob-store walk — keep off the main thread
+        own = db.open_history_db(db_path)
+        try:
+            counts = {
+                table: own.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ("note_versions", "notetype_versions", "media_events")
+            }
+        finally:
+            own.close()
+        return counts, blobs.stats()
 
-def _count(rt: scheduler.Runtime, table: str) -> int:
-    return rt.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    def on_success(result) -> None:
+        counts, blob_stats = result
+        if consts.MEDIA_ENABLED:
+            body = tr(
+                "about_body",
+                notes=counts["note_versions"],
+                notetypes=counts["notetype_versions"],
+                media=counts["media_events"],
+                blob_count=blob_stats.count,
+                blob_mb=blob_stats.total_bytes / 1_000_000,
+                db_path=str(data_dir),
+            )
+        else:
+            # media capture is off — media/blob lines would only raise questions
+            body = tr(
+                "about_body_media_off",
+                notes=counts["note_versions"],
+                notetypes=counts["notetype_versions"],
+                db_path=str(data_dir),
+            )
+        showInfo(body, title=tr("about_title"))
+
+    QueryOp(parent=mw, op=op, success=on_success).run_in_background()

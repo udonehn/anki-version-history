@@ -17,7 +17,7 @@ from anki.collection import Collection
 
 from . import capture_media, capture_notetypes, consts, db
 from .blobstore import BlobStore
-from .capture_notes import NoteScanContext, capture_note
+from .capture_notes import NoteScanContext, read_note_state, write_note_state
 
 DEFAULT_CHUNK_SIZE = 1000
 
@@ -125,17 +125,23 @@ def _process_chunk(
 ) -> tuple[int, int]:
     """One transaction: baseline a chunk of nids and commit the resume cursor
     with it. Returns (new_cursor, captured)."""
-    captured = 0
     cursor = int(rows[-1][0])
+    # Read + hash outside the write transaction (keeps the lock short); the
+    # per-nid already-indexed guard below stays inside it for resume idempotency.
+    read_states = [
+        rs
+        for rs in (read_note_state(col, int(nid), ctx.exclude_mids) for (nid,) in rows)
+        if rs is not None
+    ]
+    captured = 0
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for (nid,) in rows:
-            nid = int(nid)
+        for rs in read_states:
             already_indexed = conn.execute(
-                "select 1 from note_index where nid=?", (nid,)
+                "select 1 from note_index where nid=?", (rs.nid,)
             ).fetchone()
             if already_indexed is None:
-                if capture_note(col, conn, nid, ctx, now_ms, force=False):
+                if write_note_state(conn, rs, ctx, now_ms, force=False):
                     captured += 1
         state = get_state(conn)
         state["notes_cursor"] = cursor
@@ -205,34 +211,28 @@ def run_media_baseline(
         if should_stop is not None and should_stop():
             return captured  # state stays pending; cursor already committed
         chunk = remaining[start : start + chunk_size]
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for fname in chunk:
-                path = media_dir / fname
-                if fname in manifest or not path.is_file():
-                    continue
-                stat = path.stat()
-                result = capture_media._capture_stat(  # noqa: SLF001
-                    conn,
-                    blobs,
-                    fname,
-                    path,
-                    stat.st_size,
-                    int(stat.st_mtime * 1000),
-                    manifest,
-                    consts.ORIGIN_BASELINE,
-                    "",  # media events carry no op_label; kept empty
-                    resolved_now,
-                )
-                if result is not None:
-                    captured += 1
-            state = get_state(conn)
-            state["media_cursor"] = chunk[-1]
-            db.meta_set_json(conn, consts.META_BASELINE_STATE, state)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        # Hash/copy blobs with no lock held; commit events in one short txn.
+        states = []
+        for fname in chunk:
+            path = media_dir / fname
+            key = capture_media._nfc(fname)  # noqa: SLF001
+            if key in manifest or not path.is_file():
+                continue  # manifest membership makes an interrupted run resumable
+            state = capture_media._read_media_state(  # noqa: SLF001
+                blobs, key, path, manifest
+            )
+            if state is not None:
+                states.append(state)
+                manifest[key] = (state.sha1, state.size, state.mtime_ms)
+        added, modified = capture_media._write_media_states(  # noqa: SLF001
+            conn, states, consts.ORIGIN_BASELINE, resolved_now
+        )
+        captured += added + modified
+        # Cursor commits after the chunk txn; a crash in between just re-reads
+        # the chunk next run and skips it via the manifest check above.
+        state_dict = get_state(conn)
+        state_dict["media_cursor"] = chunk[-1]
+        db.meta_set_json(conn, consts.META_BASELINE_STATE, state_dict)
         done += len(chunk)
         if progress is not None:
             progress(done, total)

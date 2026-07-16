@@ -64,6 +64,24 @@ class BeforeState:
 
 
 @dataclass(frozen=True)
+class NoteReadState:
+    """A note's current content, read + hashed outside any write transaction.
+
+    Separating the read/hash phase (slow: ``col.get_note`` + JSON hashing) from
+    the write phase keeps ``BEGIN IMMEDIATE`` locks short — the collection read
+    happens with no history-DB lock held, and the write transaction only does
+    the per-nid ``note_index`` re-check and the row inserts."""
+
+    nid: int
+    guid: str
+    mid: int
+    fields: tuple[str, ...]
+    field_names: tuple[str, ...]
+    tags: tuple[str, ...]
+    hash: str
+
+
+@dataclass(frozen=True)
 class NoteScanContext:
     origin: str = consts.ORIGIN_AUTO
     op_label: str = ""
@@ -76,6 +94,12 @@ class NoteScanContext:
     # nid → pre-edit snapshot; the first captured version of such a note is
     # preceded by a 'baseline' row so the change stays restorable.
     before_states: dict[int, BeforeState] = field(default_factory=dict)
+    # Force the deletion set-diff even when the note count is unchanged — a sync
+    # merge can delete and add the same number of notes (net-zero count).
+    force_deletion_diff: bool = False
+    # Extra nids to hash-recheck regardless of the marker: the sync usn-window
+    # (remote edits/adds merged in below our high-water mark).
+    recheck_nids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -84,6 +108,9 @@ class NoteScanReport:
     deleted: int = 0
     resurrected: int = 0
     interrupted: bool = False
+    # nids that actually got a new version row this scan (captured or revived),
+    # NOT every candidate examined. Downstream media capture keys off this, and
+    # the scheduler folds it into session_touched — both want real changes only.
     touched_nids: frozenset[int] = frozenset()
 
 
@@ -106,22 +133,31 @@ def scan_notes(col: Collection, conn: sqlite3.Connection, ctx: NoteScanContext) 
         if _stopped(ctx):
             interrupted = True
             break
-        marker, chunk_captured = _process_marker_chunk(col, conn, ctx, chunk, marker, now_ms)
-        captured += chunk_captured
-        touched.update(int(nid) for nid, _mod in chunk)
+        marker, chunk_nids = _process_marker_chunk(col, conn, ctx, chunk, marker, now_ms)
+        captured += len(chunk_nids)
+        touched.update(chunk_nids)
 
-    if not interrupted and ctx.saw_undo and ctx.session_touched_nids:
+    # Re-check notes whose mod may sit below the marker: undo rewinds a mod (needs
+    # saw_undo + session_touched), and a sync merge lands remote edits/adds with
+    # their original, possibly-below-marker mod (recheck_nids, the usn-window).
+    if not interrupted:
+        recheck: set[int] = set(ctx.recheck_nids)
+        if ctx.saw_undo:
+            recheck |= ctx.session_touched_nids
         already = {int(nid) for nid, _mod in candidates}
-        extras = sorted(nid for nid in ctx.session_touched_nids if nid not in already)
+        extras = sorted(nid for nid in recheck if nid not in already)
         for chunk in _chunks(extras, ctx.chunk_size):
             if _stopped(ctx):
                 interrupted = True
                 break
-            captured += _process_recheck_chunk(col, conn, ctx, chunk, now_ms)
-            touched.update(chunk)
+            chunk_nids = _process_recheck_chunk(col, conn, ctx, chunk, now_ms)
+            captured += len(chunk_nids)
+            touched.update(chunk_nids)
 
     deleted = resurrected = 0
-    if not interrupted and (ctx.saw_undo or note_count != last_count):
+    if not interrupted and (
+        ctx.saw_undo or ctx.force_deletion_diff or note_count != last_count
+    ):
         deleted, resurrected, back_nids = _diff_deletions(col, conn, ctx, now_ms)
         touched |= back_nids
 
@@ -163,6 +199,79 @@ def snapshot_notes(
     return count
 
 
+def read_note_state(
+    col: Collection, nid: int, exclude_mids: frozenset[int]
+) -> NoteReadState | None:
+    """Read + hash one note (no history-DB lock held). Returns None for a
+    missing note (deletion set-diff owns those) or an excluded note type."""
+    try:
+        note = col.get_note(nid)
+    except NotFoundError:
+        return None
+    mid = int(note.mid)
+    if mid in exclude_mids:
+        return None
+    fields = tuple(note.fields)
+    tags = tuple(note.tags)
+    field_names = tuple(f["name"] for f in note.note_type()["flds"])
+    return NoteReadState(
+        nid=int(nid),
+        guid=note.guid,
+        mid=mid,
+        fields=fields,
+        field_names=field_names,
+        tags=tags,
+        hash=hashing.note_hash(mid, fields, tags),
+    )
+
+
+def write_note_state(
+    conn: sqlite3.Connection,
+    state: NoteReadState,
+    ctx: NoteScanContext,
+    now_ms: int,
+    *,
+    force: bool,
+) -> bool:
+    """Append a version row for ``state`` if it differs from the latest stored
+    version (or unconditionally when ``force``). Caller owns the transaction.
+    The ``note_index`` re-check happens HERE, inside the write transaction, so a
+    concurrent scan that already captured this content is deduped correctly.
+    Returns True when a row was inserted."""
+    index_row = conn.execute(
+        "select latest_hash, alive from note_index where nid=?", (state.nid,)
+    ).fetchone()
+    is_unchanged = (
+        index_row is not None
+        and index_row["latest_hash"] == state.hash
+        and index_row["alive"] == 1
+    )
+    if is_unchanged and not force:
+        return False
+    # Lazy baseline: the first time we ever record this note, if we cached its
+    # pre-edit state (from editor load) and it differs, store that as the
+    # 'baseline' so the change we're about to record stays restorable.
+    if index_row is None:
+        before = ctx.before_states.get(state.nid)
+        if before is not None and before.hash != state.hash:
+            _insert_before_baseline(conn, state.nid, before)
+    version = NoteVersion(
+        nid=state.nid,
+        guid=state.guid,
+        mid=state.mid,
+        ts=now_ms,
+        origin=ctx.origin,
+        op_label=ctx.op_label,
+        fields=state.fields,
+        field_names=state.field_names,
+        tags=state.tags,
+        hash=state.hash,
+    )
+    version_id = _insert_version(conn, version)
+    conn.execute(_UPSERT_INDEX_SQL, (state.nid, state.guid, state.hash, version_id, 1))
+    return True
+
+
 def capture_note(
     col: Collection,
     conn: sqlite3.Connection,
@@ -172,52 +281,30 @@ def capture_note(
     *,
     force: bool,
 ) -> bool:
-    """Capture one note's current state if it differs from the latest stored
-    version (or unconditionally when ``force``). Caller owns the transaction.
-    Returns True when a row was inserted."""
-    try:
-        note = col.get_note(nid)
-    except NotFoundError:
-        return False  # deletion set-diff owns disappeared notes
-    mid = int(note.mid)
-    if mid in ctx.exclude_mids:
+    """Read + write one note in a single call (caller owns the transaction).
+
+    Kept for callers that hold a lock for other reasons already (baseline,
+    manual snapshot, deletion-diff revive); the chunked auto-scan instead calls
+    :func:`read_note_state` outside the transaction and :func:`write_note_state`
+    inside it, to keep write locks short."""
+    state = read_note_state(col, nid, ctx.exclude_mids)
+    if state is None:
         return False
-    fields = list(note.fields)
-    tags = list(note.tags)
-    content_hash = hashing.note_hash(mid, fields, tags)
-    index_row = conn.execute(
-        "select latest_hash, alive from note_index where nid=?", (nid,)
-    ).fetchone()
-    is_unchanged = (
-        index_row is not None
-        and index_row["latest_hash"] == content_hash
-        and index_row["alive"] == 1
-    )
-    if is_unchanged and not force:
+    return write_note_state(conn, state, ctx, now_ms, force=force)
+
+
+def marker_regressed(col: Collection, conn: sqlite3.Connection) -> bool:
+    """True when the collection's max note mod sits below our scan marker — the
+    fingerprint of a full-sync download that replaced the collection with content
+    whose mods predate our high-water mark. Incremental ``mod >= marker`` scans
+    are blind to it, so the caller heals with a full rescan (which resets the
+    marker). Matches the lazy-install marker (``max_mod + 1``) and the baseline
+    marker (``max_mod``) exactly, so neither trips this."""
+    marker = db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0)
+    if marker <= 0:
         return False
-    # Lazy baseline: the first time we ever record this note, if we cached its
-    # pre-edit state (from editor load) and it differs, store that as the
-    # 'baseline' so the change we're about to record stays restorable.
-    if index_row is None:
-        before = ctx.before_states.get(nid)
-        if before is not None and before.hash != content_hash:
-            _insert_before_baseline(conn, nid, before)
-    field_names = [f["name"] for f in note.note_type()["flds"]]
-    version = NoteVersion(
-        nid=nid,
-        guid=note.guid,
-        mid=mid,
-        ts=now_ms,
-        origin=ctx.origin,
-        op_label=ctx.op_label,
-        fields=tuple(fields),
-        field_names=tuple(field_names),
-        tags=tuple(tags),
-        hash=content_hash,
-    )
-    version_id = _insert_version(conn, version)
-    conn.execute(_UPSERT_INDEX_SQL, (nid, note.guid, content_hash, version_id, 1))
-    return True
+    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    return max_mod + 1 < marker
 
 
 def full_rescan(
@@ -257,8 +344,9 @@ def full_rescan(
             interrupted = True
             break
         chunk = nids[start : start + chunk_size]
-        captured += _process_recheck_chunk(col, conn, ctx, [int(n) for n in chunk], resolved_now)
-        touched.update(int(n) for n in chunk)
+        chunk_nids = _process_recheck_chunk(col, conn, ctx, [int(n) for n in chunk], resolved_now)
+        captured += len(chunk_nids)
+        touched.update(chunk_nids)
         done += len(chunk)
         if progress is not None:
             progress(done, total)
@@ -275,6 +363,52 @@ def full_rescan(
         deleted=deleted,
         resurrected=resurrected,
         interrupted=interrupted,
+        touched_nids=frozenset(touched),
+    )
+
+
+def rescan_indexed(
+    col: Collection,
+    conn: sqlite3.Connection,
+    *,
+    op_label: str = consts.LABEL_FULL_RESCAN,
+    now_ms: int | None = None,
+) -> NoteScanReport:
+    """Lazy-mode heal for a full-sync download when NO baseline exists: re-hash
+    only the notes we already track (``note_index``), run the deletion diff, and
+    re-anchor the marker to the collection's current max mod + 1.
+
+    Unlike :func:`full_rescan` it deliberately does NOT hash-compare untracked
+    notes — that would dump the whole pre-existing collection as 'auto' rows,
+    breaking the lazy-capture contract (only notes edited since install are
+    tracked)."""
+    resolved_now = now_ms if now_ms is not None else _now_ms()
+    ctx = NoteScanContext(
+        origin=consts.ORIGIN_AUTO,
+        op_label=op_label,
+        now_ms=resolved_now,
+        force_deletion_diff=True,
+    )
+    indexed = [int(row["nid"]) for row in conn.execute("select nid from note_index")]
+    captured = 0
+    touched: set[int] = set()
+    for chunk in _chunks(indexed, DEFAULT_CHUNK_SIZE):
+        chunk_nids = _process_recheck_chunk(col, conn, ctx, chunk, resolved_now)
+        captured += len(chunk_nids)
+        touched.update(chunk_nids)
+    deleted, resurrected, back_nids = _diff_deletions(col, conn, ctx, resolved_now)
+    touched |= back_nids
+    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 1))
+    db.meta_set(
+        conn,
+        consts.META_LAST_NOTE_COUNT,
+        str(int(col.db.scalar("select count(*) from notes"))),
+    )
+    return NoteScanReport(
+        captured=captured,
+        deleted=deleted,
+        resurrected=resurrected,
         touched_nids=frozenset(touched),
     )
 
@@ -312,23 +446,31 @@ def _process_marker_chunk(
     chunk: Sequence,
     marker: int,
     now_ms: int,
-) -> tuple[int, int]:
-    """One transaction: capture a chunk of marker-query candidates and advance
-    the high-water marker to the chunk's max mod. Returns (marker, captured)."""
-    captured = 0
+) -> tuple[int, list[int]]:
+    """Read + hash the chunk with no lock held, then commit the captured rows
+    and advance the high-water marker to the chunk's max mod in one short
+    transaction. A note edited between the read and the write gets a higher mod
+    and is re-queued by the next ``mod >= marker`` scan. Returns
+    (marker, captured_nids)."""
     chunk_marker = marker
+    states: list[NoteReadState] = []
+    for nid, mod in chunk:
+        state = read_note_state(col, int(nid), ctx.exclude_mids)
+        if state is not None:
+            states.append(state)
+        chunk_marker = max(chunk_marker, int(mod))
+    captured_nids: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for nid, mod in chunk:
-            if capture_note(col, conn, int(nid), ctx, now_ms, force=False):
-                captured += 1
-            chunk_marker = max(chunk_marker, int(mod))
+        for state in states:
+            if write_note_state(conn, state, ctx, now_ms, force=False):
+                captured_nids.append(state.nid)
         db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(chunk_marker))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return chunk_marker, captured
+    return chunk_marker, captured_nids
 
 
 def _process_recheck_chunk(
@@ -337,20 +479,26 @@ def _process_recheck_chunk(
     ctx: NoteScanContext,
     chunk: Sequence[int],
     now_ms: int,
-) -> int:
-    """Undo/redo re-check: hash-compare session-touched notes whose mod may
-    have been rewound below the marker. No marker movement here."""
-    captured = 0
+) -> list[int]:
+    """Undo/sync re-check: hash-compare notes whose mod may sit below the marker
+    (undo rewind or sync merge). No marker movement here. Read/hash happens
+    outside the write transaction; returns the captured nids."""
+    states = [
+        state
+        for state in (read_note_state(col, int(nid), ctx.exclude_mids) for nid in chunk)
+        if state is not None
+    ]
+    captured_nids: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for nid in chunk:
-            if capture_note(col, conn, int(nid), ctx, now_ms, force=False):
-                captured += 1
+        for state in states:
+            if write_note_state(conn, state, ctx, now_ms, force=False):
+                captured_nids.append(state.nid)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return captured
+    return captured_nids
 
 
 def _diff_deletions(

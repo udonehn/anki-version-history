@@ -55,6 +55,8 @@ class NotetypeHistoryDialog(QDialog):
             self.setWindowModality(Qt.WindowModality.WindowModal)
         self._build_ui()
         self._populate_picker(preselect_mid)
+        # reject() (Esc) bypasses closeEvent; finished covers every close path
+        qconnect(self.finished, lambda _result: _open_dialogs.discard(self))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         _open_dialogs.discard(self)
@@ -165,7 +167,8 @@ class NotetypeHistoryDialog(QDialog):
                 label = f"{label} {tr('ntd_deleted_suffix')}"
             widgets.add_two_line_item(
                 self._list,
-                widgets.format_timestamp(version.ts),
+                # same icon language as the note timeline (origin/deleted/sync)
+                f"{widgets.row_icon(version)} {widgets.format_timestamp(version.ts)}",
                 label,
                 highlight_red=version.deleted,
             )

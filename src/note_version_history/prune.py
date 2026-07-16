@@ -66,7 +66,11 @@ def run_maintenance(
     resolved_now = now_ms if now_ms is not None else _now_ms()
     notes_pruned = prune_note_versions(conn, retention, now_ms=resolved_now)
     media_pruned = prune_media_events(conn, retention, now_ms=resolved_now)
-    blobs_removed = gc_blobs(conn, blobs) if media_pruned else 0
+    # Always GC: rolled-back captures can orphan blobs even when no media event
+    # is pruned, so gating on media_pruned would leak them forever (the default
+    # media_max_age_days=0 means media pruning never fires). The blob store's own
+    # age guard keeps this safe against in-flight writes.
+    blobs_removed = gc_blobs(conn, blobs)
     incremental_vacuum(conn)
     db.meta_set(conn, consts.META_LAST_PRUNE_MS, str(resolved_now))
     return MaintenanceReport(

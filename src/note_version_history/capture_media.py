@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-import uuid
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +29,7 @@ from pathlib import Path
 from anki.collection import Collection
 from anki.errors import NotFoundError
 
-from . import consts
+from . import consts, db
 from .blobstore import BlobStore
 from .records import MediaEvent
 
@@ -56,23 +56,44 @@ class MediaScanReport:
     interrupted: bool = False
 
 
+@dataclass(frozen=True)
+class MediaFileState:
+    """A media file's content identity, stat'd + hashed (and its blob stored)
+    with NO history-DB lock held. ``fname`` is the NFC-normalized manifest/event
+    key; the on-disk file was read under its original name."""
+
+    fname: str
+    sha1: str
+    size: int
+    mtime_ms: int
+
+
+def _nfc(name: str) -> str:
+    """Normalize a filename to NFC so a disk listing (NFD on macOS) and a note's
+    reference (NFC) map to the same manifest key — otherwise the same file reads
+    as a phantom add+delete pair."""
+    return unicodedata.normalize("NFC", name)
+
+
 def full_scan(
     col: Collection,
     conn: sqlite3.Connection,
     blobs: BlobStore,
     *,
     origin: str = consts.ORIGIN_AUTO,
-    op_label: str = "",
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     now_ms: int | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> MediaScanReport:
     """Diff the whole media folder against the manifest; store changed blobs
-    and append events. Deletion events fire only on a completed pass (an
-    interrupted scan must not misread unvisited files as deleted)."""
+    and append events. Each chunk is stat'd/hashed/stored OUTSIDE the write
+    transaction (long file I/O holds no lock), then committed in a short one
+    that re-checks the manifest per file. Deletion events fire only on a
+    completed pass (an interrupted scan must not misread unvisited files as
+    deleted)."""
     resolved_now = now_ms if now_ms is not None else _now_ms()
     media_dir = Path(col.media.dir())
-    manifest = _load_manifest(conn)
+    manifest = _load_manifest(conn)  # stat-skip hint (may be stale under concurrency)
     seen: set[str] = set()
     added = modified = 0
     interrupted = False
@@ -83,40 +104,22 @@ def full_scan(
             interrupted = True
             break
         chunk = entries[start : start + chunk_size]
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for entry in chunk:
-                seen.add(entry.name)
-                counted = _capture_entry(
-                    conn, blobs, entry, manifest, origin, op_label, resolved_now
-                )
-                if counted == "added":
-                    added += 1
-                elif counted == "modified":
-                    modified += 1
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        states: list[MediaFileState] = []
+        for entry in chunk:
+            key = _nfc(entry.name)
+            seen.add(key)
+            state = _read_media_state(blobs, key, Path(entry.path), manifest)
+            if state is not None:
+                states.append(state)
+                manifest[key] = (state.sha1, state.size, state.mtime_ms)  # refresh hint
+        chunk_added, chunk_modified = _write_media_states(conn, states, origin, resolved_now)
+        added += chunk_added
+        modified += chunk_modified
 
     deleted = 0
     if not interrupted:
-        missing = [fname for fname in manifest if fname not in seen]
-        if missing:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                for fname in missing:
-                    last_sha1, size, _mtime = manifest[fname]
-                    conn.execute(
-                        _INSERT_EVENT_SQL,
-                        (fname, resolved_now, origin, consts.EVENT_DELETED, last_sha1, size),
-                    )
-                    conn.execute("DELETE FROM media_manifest WHERE fname=?", (fname,))
-                    deleted += 1
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+        deleted = _write_deletions(conn, media_dir, seen, origin, resolved_now)
+        db.meta_set(conn, consts.META_LAST_MEDIA_SCAN_MS, str(resolved_now))
     return MediaScanReport(
         added=added, modified=modified, deleted=deleted, interrupted=interrupted
     )
@@ -129,7 +132,6 @@ def capture_files_for_notes(
     nids: Iterable[int],
     *,
     origin: str = consts.ORIGIN_AUTO,
-    op_label: str = "",
     now_ms: int | None = None,
 ) -> int:
     """Targeted capture: snapshot media files referenced by the given notes
@@ -152,7 +154,6 @@ def capture_files_for_notes(
         Path(col.media.dir()),
         sorted(fnames),
         origin=origin,
-        op_label=op_label,
         now_ms=now_ms,
     )
 
@@ -164,42 +165,28 @@ def capture_named_files(
     fnames: Iterable[str],
     *,
     origin: str = consts.ORIGIN_AUTO,
-    op_label: str = "",
     now_ms: int | None = None,
 ) -> int:
     """Stat-diff specific filenames against the manifest; store new/changed
-    content. Returns the number of events written."""
+    content. Files are read/hashed outside the write transaction, then committed
+    in one short transaction that re-checks each manifest row. Returns the number
+    of events written."""
     resolved_now = now_ms if now_ms is not None else _now_ms()
     manifest = _load_manifest(conn)
-    written = 0
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        for fname in fnames:
-            if not _safe_media_name(fname):
-                continue
-            path = media_dir / fname
-            if not path.is_file():
-                continue  # referenced but absent; media check territory
-            entry_stat = path.stat()
-            counted = _capture_stat(
-                conn,
-                blobs,
-                fname,
-                path,
-                entry_stat.st_size,
-                int(entry_stat.st_mtime * 1000),
-                manifest,
-                origin,
-                op_label,
-                resolved_now,
-            )
-            if counted in ("added", "modified"):
-                written += 1
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    return written
+    states: list[MediaFileState] = []
+    for raw in fnames:
+        if not _safe_media_name(raw):
+            continue
+        path = media_dir / raw  # filesystem access under the note's own spelling
+        if not path.is_file():
+            continue  # referenced but absent; media check territory
+        key = _nfc(raw)
+        state = _read_media_state(blobs, key, path, manifest)
+        if state is not None:
+            states.append(state)
+            manifest[key] = (state.sha1, state.size, state.mtime_ms)
+    added, modified = _write_media_states(conn, states, origin, resolved_now)
+    return added + modified
 
 
 def restore_media_file(
@@ -209,21 +196,23 @@ def restore_media_file(
     fname: str,
     sha1: str,
     *,
-    op_label: str = "",
-    pre_backup_label: str = "",
     now_ms: int | None = None,
 ) -> None:
-    """Write a stored blob back under its EXACT original name (C4).
+    """Write a stored blob back under its EXACT original name.
 
     The current on-disk content (if any, and if unknown to the store) is
-    snapshotted first — restoring is itself reversible through history.
-    Not part of Anki's undo (media never is)."""
+    snapshotted first — restoring is itself reversible through history. The blob
+    is streamed to the target (temp + os.replace), never loaded whole into
+    memory, and a missing blob raises before any history row is written. Not
+    part of Anki's undo (media never is)."""
     if not _safe_media_name(fname):
         raise ValueError(f"unsafe media filename: {fname!r}")
+    if not blobs.has(sha1):
+        raise FileNotFoundError(f"blob {sha1} is missing from the store")
     resolved_now = now_ms if now_ms is not None else _now_ms()
     media_dir = Path(col.media.dir())
     target = media_dir / fname
-    data = blobs.read_bytes(sha1)  # FileNotFoundError if the blob is gone
+    key = _nfc(fname)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -231,12 +220,12 @@ def restore_media_file(
         if existed:
             current_sha1, current_size = blobs.put_file(target)
             manifest = _load_manifest(conn)
-            known = manifest.get(fname)
+            known = manifest.get(key)
             if known is None or known[0] != current_sha1:
                 conn.execute(
                     _INSERT_EVENT_SQL,
                     (
-                        fname,
+                        key,
                         resolved_now,
                         consts.ORIGIN_RESTORE,
                         consts.EVENT_MODIFIED if known is not None else consts.EVENT_ADDED,
@@ -244,35 +233,26 @@ def restore_media_file(
                         current_size,
                     ),
                 )
-        tmp = media_dir / f".nvh-tmp-{uuid.uuid4().hex}"
-        try:
-            tmp.write_bytes(data)
-            os.replace(tmp, target)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        size = blobs.copy_to(sha1, target)  # stream blob → exact original name
         conn.execute(
             _INSERT_EVENT_SQL,
             (
-                fname,
+                key,
                 resolved_now,
                 consts.ORIGIN_RESTORE,
                 consts.EVENT_MODIFIED if existed else consts.EVENT_ADDED,
                 sha1,
-                len(data),
+                size,
             ),
         )
         conn.execute(
             _UPSERT_MANIFEST_SQL,
-            (fname, sha1, len(data), int(target.stat().st_mtime * 1000)),
+            (key, sha1, size, int(target.stat().st_mtime * 1000)),
         )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    # pre_backup_label is folded into op_label reporting by the UI; kept as a
-    # parameter so callers can localize without this module importing i18n.
-    del op_label, pre_backup_label
 
 
 def list_media_events(conn: sqlite3.Connection, fname: str) -> list[MediaEvent]:
@@ -346,56 +326,122 @@ def _load_manifest(conn: sqlite3.Connection) -> dict[str, tuple[str, int, int]]:
     }
 
 
-def _capture_entry(
-    conn, blobs, entry, manifest, origin, op_label, now_ms
-) -> str | None:
-    stat = entry.stat()
-    return _capture_stat(
-        conn,
-        blobs,
-        entry.name,
-        Path(entry.path),
-        stat.st_size,
-        int(stat.st_mtime * 1000),
-        manifest,
-        origin,
-        op_label,
-        now_ms,
-    )
-
-
-def _capture_stat(
-    conn: sqlite3.Connection,
+def _read_media_state(
     blobs: BlobStore,
     fname: str,
     path: Path,
-    size: int,
-    mtime_ms: int,
-    manifest: dict[str, tuple[str, int, int]],
+    manifest_hint: dict[str, tuple[str, int, int]],
+) -> MediaFileState | None:
+    """Stat + (only if the stat changed) hash/store one file, with NO history-DB
+    lock held. ``fname`` is the NFC key; ``path`` reads the on-disk file under
+    its original name. Returns None when the stat matches the manifest hint
+    (content assumed unchanged) or the file has vanished."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    size = stat.st_size
+    mtime_ms = int(stat.st_mtime * 1000)
+    known = manifest_hint.get(fname)
+    if known is not None and known[1] == size and known[2] == mtime_ms:
+        return None
+    sha1, actual_size = blobs.put_file(path)
+    return MediaFileState(fname=fname, sha1=sha1, size=actual_size, mtime_ms=mtime_ms)
+
+
+def _apply_media_state(
+    conn: sqlite3.Connection,
+    state: MediaFileState,
     origin: str,
-    op_label: str,
     now_ms: int,
 ) -> str | None:
-    """Caller owns the transaction. Returns 'added'/'modified'/None."""
-    known = manifest.get(fname)
-    if known is not None and known[1] == size and known[2] == mtime_ms:
-        return None  # stat unchanged → content assumed unchanged
-    sha1, actual_size = blobs.put_file(path)
-    if known is None:
+    """Caller owns the transaction. Re-reads the manifest row for this fname
+    INSIDE the transaction so a concurrent scan that already recorded the same
+    content is deduped, not double-logged. Returns 'added'/'modified'/None
+    (metadata-only drift)."""
+    row = conn.execute(
+        "select sha1 from media_manifest where fname=?", (state.fname,)
+    ).fetchone()
+    if row is None:
         event = consts.EVENT_ADDED
-    elif known[0] != sha1:
+    elif row[0] != state.sha1:
         event = consts.EVENT_MODIFIED
     else:
-        # metadata drift only (same content): refresh manifest, no event
-        conn.execute(_UPSERT_MANIFEST_SQL, (fname, sha1, actual_size, mtime_ms))
-        manifest[fname] = (sha1, actual_size, mtime_ms)
+        # same content, only size/mtime metadata drifted → refresh, no event
+        conn.execute(
+            _UPSERT_MANIFEST_SQL, (state.fname, state.sha1, state.size, state.mtime_ms)
+        )
         return None
     conn.execute(
-        _INSERT_EVENT_SQL, (fname, now_ms, origin, event, sha1, actual_size)
+        _INSERT_EVENT_SQL, (state.fname, now_ms, origin, event, state.sha1, state.size)
     )
-    conn.execute(_UPSERT_MANIFEST_SQL, (fname, sha1, actual_size, mtime_ms))
-    manifest[fname] = (sha1, actual_size, mtime_ms)
-    return "added" if event == consts.EVENT_ADDED else "modified"
+    conn.execute(
+        _UPSERT_MANIFEST_SQL, (state.fname, state.sha1, state.size, state.mtime_ms)
+    )
+    return event
+
+
+def _write_media_states(
+    conn: sqlite3.Connection,
+    states: list[MediaFileState],
+    origin: str,
+    now_ms: int,
+) -> tuple[int, int]:
+    """Commit a chunk of pre-hashed states in one short transaction. Returns
+    (added, modified)."""
+    added = modified = 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for state in states:
+            result = _apply_media_state(conn, state, origin, now_ms)
+            if result == consts.EVENT_ADDED:
+                added += 1
+            elif result == consts.EVENT_MODIFIED:
+                modified += 1
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return added, modified
+
+
+def _write_deletions(
+    conn: sqlite3.Connection,
+    media_dir: Path,
+    seen: set[str],
+    origin: str,
+    now_ms: int,
+) -> int:
+    """Emit deletion events for manifest files not seen this pass.
+
+    Two concurrency guards: the manifest is re-read fresh (a row a concurrent
+    scan already tombstoned is gone, so no duplicate deletion event), and each
+    candidate is stat-checked on disk (a file recorded by a concurrent targeted
+    capture AFTER our directory listing is present, not deleted)."""
+    manifest = _load_manifest(conn)
+    missing = [
+        fname
+        for fname in manifest
+        if fname not in seen and not (media_dir / fname).is_file()
+    ]
+    if not missing:
+        return 0
+    deleted = 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for fname in missing:
+            last_sha1, size, _mtime = manifest[fname]
+            conn.execute(
+                _INSERT_EVENT_SQL,
+                (fname, now_ms, origin, consts.EVENT_DELETED, last_sha1, size),
+            )
+            conn.execute("DELETE FROM media_manifest WHERE fname=?", (fname,))
+            deleted += 1
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return deleted
 
 
 def _safe_media_name(fname: str) -> bool:

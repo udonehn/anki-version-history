@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from aqt import mw
+from aqt.operations import QueryOp
 from aqt.qt import (
     QDialog,
     QHBoxLayout,
@@ -12,15 +15,18 @@ from aqt.qt import (
     QPushButton,
     QSplitter,
     Qt,
+    QTimer,
     QVBoxLayout,
     qconnect,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
-from .. import capture_media, scheduler
+from .. import capture_media, db, scheduler
 from ..i18n import tr
 from ..records import MediaEvent
 from . import widgets
+
+_FILTER_DEBOUNCE_MS = 250
 
 _open_dialogs: set["MediaHistoryDialog"] = set()
 
@@ -39,10 +45,18 @@ class MediaHistoryDialog(QDialog):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self._events: list[MediaEvent] = []
+        # typing in the filter must not walk the blob store / rescan the event
+        # table per keystroke — coalesce into one reload per pause
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        qconnect(self._filter_timer.timeout, self._reload_files)
         self.setWindowTitle(tr("md_title"))
         self.resize(900, 600)
         self._build_ui()
         self._reload_files()
+        self._update_stats()
+        # reject() (Esc) bypasses closeEvent; finished covers every close path
+        qconnect(self.finished, lambda _result: _open_dialogs.discard(self))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         _open_dialogs.discard(self)
@@ -54,7 +68,10 @@ class MediaHistoryDialog(QDialog):
         top = QHBoxLayout()
         top.addWidget(QLabel(tr("md_filter")))
         self._filter = QLineEdit()
-        qconnect(self._filter.textChanged, lambda _text: self._reload_files())
+        qconnect(
+            self._filter.textChanged,
+            lambda _text: self._filter_timer.start(_FILTER_DEBOUNCE_MS),
+        )
         top.addWidget(self._filter, 1)
         scan_button = QPushButton(tr("md_scan_now"))
         qconnect(scan_button.clicked, self._scan_now)
@@ -100,13 +117,12 @@ class MediaHistoryDialog(QDialog):
                 fname,
                 f"{tr('event_' + last_event)} · {widgets.format_timestamp(ts)}",
             )
-            item.setData(0x0100, fname)  # Qt.ItemDataRole.UserRole
+            item.setData(Qt.ItemDataRole.UserRole, fname)
         self._reload_events()
-        self._update_stats()
 
     def _current_fname(self) -> str | None:
         item = self._files.currentItem()
-        return item.data(0x0100) if item is not None else None
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
     def _reload_events(self) -> None:
         rt = scheduler.runtime()
@@ -150,15 +166,33 @@ class MediaHistoryDialog(QDialog):
         event = self._events[row]
         if not askUser(tr("md_restore_confirm", fname=fname), parent=self):
             return
-        try:
-            capture_media.restore_media_file(
-                mw.col, rt.conn, rt.blobs, fname, event.sha1
-            )
-        except (OSError, ValueError) as exc:
-            showWarning(tr("md_restore_failed", error=str(exc)))
-            return
-        tooltip(tr("md_restore_done"))
-        self._reload_files()
+        # Background: restoring streams/hashes potentially large files, and the
+        # history-DB write may briefly wait on a running scan — neither belongs
+        # on the main thread. Own connection, never the main-thread one.
+        db_path = scheduler.profile_db_path(rt)
+        blobs = rt.blobs
+
+        def op(col):
+            own = db.open_history_db(db_path)
+            try:
+                capture_media.restore_media_file(col, own, blobs, fname, event.sha1)
+            finally:
+                own.close()
+
+        def on_success(_result) -> None:
+            tooltip(tr("md_restore_done"))
+            self._reload_files()
+            self._update_stats()
+
+        def on_failure(exc: BaseException) -> None:
+            if isinstance(exc, (OSError, ValueError, sqlite3.Error)):
+                showWarning(tr("md_restore_failed", error=str(exc)))
+            else:
+                raise exc
+
+        QueryOp(parent=self, op=op, success=on_success).failure(
+            on_failure
+        ).run_in_background()
 
     def _scan_now(self) -> None:
         def on_done(report) -> None:
@@ -171,6 +205,7 @@ class MediaHistoryDialog(QDialog):
                 )
             )
             self._reload_files()
+            self._update_stats()
 
         if not scheduler.request_media_scan(on_done):
             tooltip(tr("md_not_ready"))

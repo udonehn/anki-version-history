@@ -280,3 +280,121 @@ def test_marker_is_high_water_and_persisted(col, conn):
     scan(col, conn)
     marker_after_scan = db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0)
     assert marker_after_scan >= marker_after_baseline
+
+
+def test_write_note_state_rechecks_inside_txn(col, conn):
+    # Two overlapping scans hash the same new content; the second writer must
+    # dedupe against note_index INSIDE its own write transaction, not dupe.
+    note = add_note(col, front="v1")
+    baseline.run_notes_baseline(col, conn)
+    fresh = col.get_note(note.id)
+    fresh["Front"] = "v2"
+    col.update_note(fresh)
+
+    ctx = NoteScanContext()
+    state_a = capture_notes.read_note_state(col, int(note.id), frozenset())
+    state_b = capture_notes.read_note_state(col, int(note.id), frozenset())
+
+    conn.execute("BEGIN IMMEDIATE")
+    assert capture_notes.write_note_state(conn, state_a, ctx, 1000, force=False) is True
+    conn.execute("COMMIT")
+    conn.execute("BEGIN IMMEDIATE")
+    assert capture_notes.write_note_state(conn, state_b, ctx, 1001, force=False) is False
+    conn.execute("COMMIT")
+
+    assert len(list_note_versions(conn, note.id)) == 2  # baseline + one auto, no dupe
+
+
+def test_touched_nids_only_includes_captured(col, conn):
+    a = add_note(col, front="a")
+    b = add_note(col, front="b")
+    baseline.run_notes_baseline(col, conn)
+
+    fa = col.get_note(a.id)
+    fa["Front"] = "a2"
+    col.update_note(fa)
+    fb = col.get_note(b.id)
+    col.update_note(fb)  # mod bump, identical content → not captured
+
+    report = scan(col, conn)
+    assert report.touched_nids == frozenset({int(a.id)})
+
+
+def test_full_rescan_touched_empty_when_unchanged(col, conn):
+    add_note(col)
+    add_note(col)
+    baseline.run_notes_baseline(col, conn)
+
+    report = capture_notes.full_rescan(col, conn)
+    assert report.captured == 0
+    assert report.touched_nids == frozenset()
+
+
+def test_marker_regressed_detects_full_sync_rewind(col, conn):
+    add_note(col)
+    assert capture_notes.marker_regressed(col, conn) is False  # no marker yet
+
+    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 1))
+    assert capture_notes.marker_regressed(col, conn) is False  # lazy-install marker
+
+    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 100))
+    assert capture_notes.marker_regressed(col, conn) is True  # mods rewound below
+
+
+def test_force_deletion_diff_catches_net_zero_swap(col, conn):
+    add_note(col, front="keep")
+    doomed = add_note(col, front="doomed")
+    baseline.run_notes_baseline(col, conn)
+    scan(col, conn)  # settle last_note_count = 2
+
+    col.remove_notes([doomed.id])
+    add_note(col, front="new")  # count returns to 2 → count triage blind
+
+    plain = scan(col, conn)
+    assert plain.deleted == 0  # net-zero count, no undo → deletion diff skipped
+
+    forced = scan(col, conn, force_deletion_diff=True)
+    assert forced.deleted == 1
+
+
+def test_recheck_nids_captures_below_marker_edit(col, conn):
+    note = add_note(col, front="original")
+    baseline.run_notes_baseline(col, conn)
+    marker = db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0)
+
+    # simulate a sync merge: content changed but mod landed below our marker
+    col.db.execute(
+        "update notes set flds=?, mod=? where id=?",
+        "remote-edit\x1fb",
+        marker - 5,
+        int(note.id),
+    )
+
+    assert scan(col, conn).captured == 0  # plain scan can't see it (mod < marker)
+
+    report = scan(col, conn, recheck_nids=frozenset({int(note.id)}))
+    assert report.captured == 1
+    assert list_note_versions(conn, note.id)[0].fields[0] == "remote-edit"
+
+
+def test_rescan_indexed_only_touches_tracked_notes(col, conn):
+    # Lazy install (no baseline): only notes edited since install are tracked.
+    tracked = add_note(col, front="a")
+    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 1))
+    db.meta_set(conn, consts.META_LAST_NOTE_COUNT, "1")
+
+    # 'tracked' enters the index the way a first lazy edit would
+    capture_notes.snapshot_notes(col, conn, [tracked.id])
+    assert conn.execute("select count(*) from note_index").fetchone()[0] == 1
+
+    # an untracked note appears as if merged in by a full-sync download
+    untracked = add_note(col, front="b")
+
+    report = capture_notes.rescan_indexed(col, conn)
+    assert report.captured == 0  # 'tracked' unchanged, 'untracked' never dumped
+    assert list_note_versions(conn, untracked.id) == []
+
+    new_max = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    assert db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0) == new_max + 1
