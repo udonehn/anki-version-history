@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import consts
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class HistoryDbError(Exception):
@@ -100,11 +100,97 @@ def _create_v1(conn: sqlite3.Connection) -> None:
     conn.executescript(_DDL_V1)
 
 
-# Migration infrastructure is kept for post-release schema changes; pre-release
-# there is a single version and local data is simply recreated when the shape
-# changes (no back-compat needed yet).
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _create_v2(conn: sqlite3.Connection) -> None:
+    """Migrate v1 in place while preserving append-only version row IDs.
+
+    ``note_index`` is a mutable cache, so it can be rebuilt around a GUID-based
+    logical identity. Version tables are altered in place to keep every row ID
+    and payload byte-for-byte intact.
+    """
+    if "user_label" not in _column_names(conn, "note_versions"):
+        conn.execute(
+            "ALTER TABLE note_versions "
+            "ADD COLUMN user_label TEXT NOT NULL DEFAULT ''"
+        )
+    if "pinned" not in _column_names(conn, "note_versions"):
+        conn.execute(
+            "ALTER TABLE note_versions "
+            "ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+        )
+    if "user_label" not in _column_names(conn, "notetype_versions"):
+        conn.execute(
+            "ALTER TABLE notetype_versions "
+            "ADD COLUMN user_label TEXT NOT NULL DEFAULT ''"
+        )
+    if "pinned" not in _column_names(conn, "notetype_versions"):
+        conn.execute(
+            "ALTER TABLE notetype_versions "
+            "ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+        )
+
+    index_columns = _column_names(conn, "note_index")
+    if "identity" not in index_columns:
+        old_rows = conn.execute(
+            "SELECT nid, guid, latest_hash, latest_version, alive "
+            "FROM note_index ORDER BY latest_version"
+        ).fetchall()
+        conn.execute(
+            "CREATE TABLE note_index_v2 ("
+            " identity TEXT PRIMARY KEY,"
+            " nid INTEGER NOT NULL,"
+            " guid TEXT NOT NULL DEFAULT '',"
+            " latest_hash TEXT NOT NULL,"
+            " latest_version INTEGER NOT NULL,"
+            " alive INTEGER NOT NULL DEFAULT 1"
+            ") WITHOUT ROWID"
+        )
+        for row in old_rows:
+            identity = note_identity(int(row["nid"]), str(row["guid"]))
+            conn.execute(
+                "INSERT INTO note_index_v2"
+                " (identity, nid, guid, latest_hash, latest_version, alive)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(identity) DO UPDATE SET"
+                " nid=excluded.nid, guid=excluded.guid,"
+                " latest_hash=excluded.latest_hash,"
+                " latest_version=excluded.latest_version, alive=excluded.alive"
+                " WHERE excluded.latest_version >= note_index_v2.latest_version",
+                (
+                    identity,
+                    row["nid"],
+                    row["guid"],
+                    row["latest_hash"],
+                    row["latest_version"],
+                    row["alive"],
+                ),
+            )
+        conn.execute("DROP TABLE note_index")
+        conn.execute("ALTER TABLE note_index_v2 RENAME TO note_index")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_note_index_nid ON note_index (nid)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_note_versions_guid "
+        "ON note_versions (guid, id)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS note_scan_boundary ("
+        " nid INTEGER PRIMARY KEY,"
+        " guid TEXT NOT NULL DEFAULT '',"
+        " hash TEXT NOT NULL,"
+        " mod INTEGER NOT NULL"
+        ") WITHOUT ROWID"
+    )
+
+
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _create_v1),
+    (2, _create_v2),
 ]
 
 
@@ -149,11 +235,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for target, apply_migration in _MIGRATIONS:
         if current >= target:
             continue
-        # executescript commits implicitly; DDL uses IF NOT EXISTS so a crash
-        # between the script and the version bump is safely re-runnable.
-        apply_migration(conn)
-        meta_set(conn, consts.META_SCHEMA_VERSION, str(target))
+        # v1 uses executescript so that a fresh, empty DB is safely restartable.
+        # All later migrations are a single transaction including the version
+        # bump, which guarantees either the complete new shape or the old one.
+        if target == 1:
+            apply_migration(conn)
+            meta_set(conn, consts.META_SCHEMA_VERSION, str(target))
+            current = target
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            apply_migration(conn)
+            meta_set(conn, consts.META_SCHEMA_VERSION, str(target))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         current = target
+
+
+def note_identity(nid: int, guid: str) -> str:
+    """Stable logical note key; legacy empty GUID rows remain addressable."""
+    return f"g:{guid}" if guid else f"n:{int(nid)}"
 
 
 # --- meta helpers (autocommit connection: writes persist immediately) ---

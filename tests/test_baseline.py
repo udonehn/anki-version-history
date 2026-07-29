@@ -96,3 +96,67 @@ def test_progress_callback_reports_totals(col, conn):
 
     assert seen[-1] == (12, 12)
     assert all(total == 12 for _done, total in seen)
+
+
+# --- first-run offer gate ---
+
+
+def test_should_offer_first_run_default_pending(conn):
+    assert baseline.should_offer_first_run(conn)
+
+
+def test_should_offer_first_run_false_after_done(col, conn):
+    add_notes(col, 2)
+    baseline.run_notes_baseline(col, conn)
+    assert not baseline.should_offer_first_run(conn)
+
+
+def test_skip_records_decline_and_suppresses_offer(conn):
+    baseline.skip_notes_baseline(conn)
+    assert baseline.get_state(conn)["notes"] == baseline.STATE_SKIPPED
+    assert not baseline.should_offer_first_run(conn)
+    assert not baseline.notes_baseline_done(conn)
+
+
+def test_skip_after_done_is_noop(col, conn):
+    add_notes(col, 1)
+    baseline.run_notes_baseline(col, conn)
+    baseline.skip_notes_baseline(conn)
+    assert baseline.get_state(conn)["notes"] == baseline.STATE_DONE
+
+
+def test_baseline_runs_and_completes_after_skip(col, conn):
+    add_notes(col, 3)
+    baseline.skip_notes_baseline(conn)
+
+    captured = baseline.run_notes_baseline(col, conn)
+
+    assert captured == 3
+    assert baseline.notes_baseline_done(conn)
+
+
+def test_interrupted_run_still_offers_resume(col, conn):
+    add_notes(col, 25)
+    calls = {"n": 0}
+
+    def stop_after_first_chunk() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    baseline.run_notes_baseline(
+        col, conn, chunk_size=10, should_stop=stop_after_first_chunk
+    )
+
+    assert baseline.should_offer_first_run(conn)
+    assert int(baseline.get_state(conn)["notes_cursor"]) > 0
+
+
+def test_reoptin_after_skip_restores_offer(conn):
+    baseline.skip_notes_baseline(conn)
+    baseline.update_state(conn, notes=baseline.STATE_PENDING)
+    assert baseline.should_offer_first_run(conn)
+
+
+def test_skip_notes_leaves_media_state_untouched(conn):
+    baseline.skip_notes_baseline(conn)
+    assert baseline.media_baseline_state(conn) == baseline.STATE_PENDING

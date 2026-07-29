@@ -196,6 +196,22 @@ def test_manual_snapshot_bypasses_dedupe(col, conn):
     assert versions[0].hash == versions[1].hash
 
 
+def test_bulk_snapshot_applies_shared_annotation(col, conn):
+    notes = [add_note(col, front=f"n{index}") for index in range(2)]
+    assert capture_notes.snapshot_notes(
+        col,
+        conn,
+        [note.id for note in notes],
+        user_label="Release point",
+        pinned=True,
+        chunk_size=1,
+    ) == 2
+    for note in notes:
+        version = list_note_versions(conn, note.id)[0]
+        assert version.user_label == "Release point"
+        assert version.pinned
+
+
 def test_lazy_baseline_from_before_state(col, conn):
     # no install baseline was taken; only the editor-load cache exists
     note = add_note(col, front="original", back="b")
@@ -397,4 +413,80 @@ def test_rescan_indexed_only_touches_tracked_notes(col, conn):
     assert list_note_versions(conn, untracked.id) == []
 
     new_max = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
-    assert db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0) == new_max + 1
+    assert db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0) == new_max
+    assert conn.execute("select count(*) from note_scan_boundary").fetchone()[0] >= 1
+
+
+def test_guid_identity_splits_reused_nid_and_tracks_moved_nid(conn):
+    ctx = NoteScanContext()
+    first = capture_notes.NoteReadState(
+        nid=10,
+        guid="first",
+        mid=1,
+        fields=("same",),
+        field_names=("Front",),
+        tags=(),
+        hash="same-hash",
+    )
+    replacement = capture_notes.NoteReadState(
+        nid=10,
+        guid="replacement",
+        mid=1,
+        fields=("same",),
+        field_names=("Front",),
+        tags=(),
+        hash="same-hash",
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    assert capture_notes.write_note_state(conn, first, ctx, 1, force=False)
+    assert capture_notes.write_note_state(conn, replacement, ctx, 2, force=False)
+    conn.execute("COMMIT")
+
+    old = list_note_versions(conn, 10, guid="first")
+    new = list_note_versions(conn, 10, guid="replacement")
+    assert [version.deleted for version in old] == [True, False]
+    assert len(new) == 1
+    assert conn.execute(
+        "select count(*) from note_index where nid=10"
+    ).fetchone()[0] == 2
+
+    moved = capture_notes.NoteReadState(
+        nid=99,
+        guid="replacement",
+        mid=1,
+        fields=("same",),
+        field_names=("Front",),
+        tags=(),
+        hash="same-hash",
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    assert not capture_notes.write_note_state(conn, moved, ctx, 3, force=False)
+    conn.execute("COMMIT")
+    assert conn.execute(
+        "select nid from note_index where identity='g:replacement'"
+    ).fetchone()[0] == 99
+    assert list_note_versions(conn, 99)[0].nid == 10
+
+
+def test_lazy_boundary_skips_old_state_but_captures_same_second_changes(col, conn):
+    unchanged = add_note(col, front="unchanged")
+    edited = add_note(col, front="before")
+    marker = capture_notes.initialize_lazy_boundary(col, conn)
+
+    changed = col.get_note(edited.id)
+    changed["Front"] = "after"
+    col.update_note(changed)
+    newcomer = add_note(col, front="new")
+    col.db.execute(
+        "update notes set mod=? where id in (?,?,?)",
+        marker,
+        int(unchanged.id),
+        int(edited.id),
+        int(newcomer.id),
+    )
+
+    report = scan(col, conn)
+    assert report.captured == 2
+    assert list_note_versions(conn, unchanged.id) == []
+    assert list_note_versions(conn, edited.id)[0].fields[0] == "after"
+    assert list_note_versions(conn, newcomer.id)[0].fields[0] == "new"

@@ -10,6 +10,11 @@ _EN = {
     # Tools menu
     "menu_root": "Note Version History",
     "menu_about": "About / Statistics…",
+    "menu_connect_history": "Reconnect Previous Profile History…",
+    "connect_history_title": "Reconnect Previous Profile History",
+    "connect_history_item": "{profile} — {rows} rows — latest {latest}",
+    "connect_history_none": "No other version-history databases were found.",
+    "connect_history_done": "The selected version history is now connected.",
     # About dialog
     "about_title": "Version History — Statistics",
     "about_body": (
@@ -41,7 +46,7 @@ _EN = {
         "full and restart Anki; if it persists, please report it."
     ),
     # Baseline wizard
-    "baseline_intro_title": "Version History — Full Baseline",
+    "baseline_intro_title": "Note Version History — Create Baseline",
     "baseline_intro": (
         "Notes are already captured automatically as you edit them. This adds "
         "a one-time baseline of your ENTIRE collection, so even notes you "
@@ -53,6 +58,15 @@ _EN = {
     ),
     "baseline_resume_prompt": (
         "A previous baseline run was interrupted. Resume it now?\n\n"
+        "Notes: {notes} (~{mb:.1f} MB of text)\n"
+        "Note types: {notetypes}"
+    ),
+    "baseline_first_run_intro": (
+        "{addon_name} has been installed.\n"
+        "From now on, a change history is saved automatically whenever you "
+        "edit a note.\n\n"
+        "We recommend creating a baseline to preserve the initial state of "
+        "your existing notes. Create it now?\n\n"
         "Notes: {notes} (~{mb:.1f} MB of text)\n"
         "Note types: {notetypes}"
     ),
@@ -68,6 +82,7 @@ _EN = {
     "no_note_selected": "Select a note first.",
     "menu_snapshot_selected": "Snapshot {count} Selected Note(s)",
     "snapshot_done": "Snapshot saved ({count} note(s)).",
+    "snapshot_progress": "Saving snapshots…",
     "editor_history_tip": "Version history (snapshot and restore)",
     "editor_unsaved_note": "Save the note first (it has no id yet).",
     "no_profile_open": "No profile is open.",
@@ -83,6 +98,31 @@ _EN = {
     "hd_snapshot_now": "Add Snapshot",
     "hd_close": "Close",
     "hd_tags": "Tags",
+    "timeline_search": "Search name, operation, origin, or tags…",
+    "search_content": "Include fields/templates",
+    "pinned_only": "Pinned only",
+    "filter_all": "All",
+    "filter_automatic": "Automatic",
+    "filter_sync": "Sync",
+    "filter_snapshot": "Snapshots",
+    "filter_restore": "Restores",
+    "filter_baseline": "Baselines",
+    "filter_deleted": "Deleted",
+    "filter_pinned": "Pinned",
+    "page_previous": "Previous",
+    "page_next": "Next",
+    "page_range": "{start}–{end} of {total}",
+    "compare_set_a": "Set A",
+    "compare_set_b": "Set B",
+    "compare_swap": "Swap A/B",
+    "compare_clear": "Clear A/B",
+    "compare_status": "A: {a}  →  B: {b}",
+    "compare_selected_versions": "Compare specified versions (A→B)",
+    "compare_select_both": "Select versions A and B from the timeline.",
+    "snapshot_options": "Snapshot Options",
+    "version_name": "Version name:",
+    "pin_important": "Pin as an important version",
+    "edit_version_metadata": "Edit Version Information…",
     "hd_deleted_banner": (
         "The note was deleted at this point. Its content from just before the "
         "deletion can be brought back with 'Restore as New Note' below."
@@ -202,7 +242,7 @@ _EN = {
     "media_baseline_progress_label": "Media: {done} / {total} files",
     "media_baseline_done": "Media baseline complete ({count} files).",
     # Maintenance
-    "menu_full_rescan": "Full Rescan",
+    "menu_full_rescan": "Check & Repair Missing History…",
     "rescan_needs_baseline": (
         "Full rescan is available after a full baseline "
         "(Tools → Baseline Entire Collection)."
@@ -210,7 +250,7 @@ _EN = {
     "rescan_progress": "Rescanning all notes…",
     "rescan_progress_label": "Rescan: {done} / {total} notes",
     "rescan_done": "Full rescan finished: {captured} change(s) captured.",
-    "menu_compact": "Compact Database",
+    "menu_compact": "Reclaim Database Space…",
     "compact_progress": "Compacting version history…",
     "compact_done": "Compact finished. Removed {blobs} unused stored file(s).",
 }
@@ -221,6 +261,11 @@ _KO = {
     # Tools menu
     "menu_root": "노트 버전 기록",
     "menu_about": "정보 / 통계…",
+    "menu_connect_history": "이전 프로필 기록 다시 연결…",
+    "connect_history_title": "이전 프로필 기록 다시 연결",
+    "connect_history_item": "{profile} — {rows}개 행 — 최근 {latest}",
+    "connect_history_none": "연결할 다른 버전 기록 데이터베이스가 없습니다.",
+    "connect_history_done": "선택한 버전 기록에 연결했습니다.",
     # About dialog
     "about_title": "버전 기록 — 통계",
     "about_body": (
@@ -252,7 +297,7 @@ _KO = {
         "계속되면 제보해 주세요."
     ),
     # Baseline wizard
-    "baseline_intro_title": "버전 기록 — 전체 베이스라인",
+    "baseline_intro_title": "노트 버전 기록 — 베이스라인 생성",
     "baseline_intro": (
         "편집하는 노트는 이미 자동으로 기록됩니다. 여기서는 컬렉션 '전체'를 "
         "1회 베이스라인으로 저장해, 아직 편집하지 않은 노트도 나중에 되돌릴 수 "
@@ -266,6 +311,14 @@ _KO = {
         "노트: {notes}개 (텍스트 약 {mb:.1f} MB)\n"
         "노트타입: {notetypes}개"
     ),
+    "baseline_first_run_intro": (
+        "{addon_name} 애드온이 설치되었습니다!\n"
+        "이제부터 노트를 편집할 때마다 변경 이력이 자동으로 저장됩니다.\n\n"
+        "기존 노트의 초기 상태를 보관하기 위해 베이스라인 생성을 권장합니다. "
+        "지금 생성하시겠습니까?\n\n"
+        "노트: {notes}개 (텍스트 약 {mb:.1f} MB)\n"
+        "노트타입: {notetypes}개"
+    ),
     "baseline_progress": "베이스라인 저장 중…",
     "baseline_progress_label": "베이스라인: {done} / {total} 노트",
     "baseline_done": "버전 기록 베이스라인 완료 ({count}개 노트).",
@@ -276,6 +329,7 @@ _KO = {
     "no_note_selected": "먼저 노트를 선택하세요.",
     "menu_snapshot_selected": "선택한 노트 {count}개 스냅샷",
     "snapshot_done": "스냅샷 저장됨 ({count}개 노트).",
+    "snapshot_progress": "스냅샷 저장 중…",
     "editor_history_tip": "버전 기록 (스냅샷·복원)",
     "editor_unsaved_note": "먼저 노트를 저장하세요 (아직 id가 없습니다).",
     "no_profile_open": "열려 있는 프로필이 없습니다.",
@@ -291,6 +345,31 @@ _KO = {
     "hd_snapshot_now": "스냅샷 추가",
     "hd_close": "닫기",
     "hd_tags": "태그",
+    "timeline_search": "이름·작업·출처·태그 검색…",
+    "search_content": "필드/템플릿 내용 포함",
+    "pinned_only": "고정 항목만",
+    "filter_all": "전체",
+    "filter_automatic": "자동",
+    "filter_sync": "동기화",
+    "filter_snapshot": "스냅샷",
+    "filter_restore": "복원",
+    "filter_baseline": "베이스라인",
+    "filter_deleted": "삭제",
+    "filter_pinned": "고정",
+    "page_previous": "이전",
+    "page_next": "다음",
+    "page_range": "전체 {total}개 중 {start}–{end}",
+    "compare_set_a": "A로 지정",
+    "compare_set_b": "B로 지정",
+    "compare_swap": "A/B 교환",
+    "compare_clear": "A/B 초기화",
+    "compare_status": "A: {a}  →  B: {b}",
+    "compare_selected_versions": "지정한 두 버전 비교 (A→B)",
+    "compare_select_both": "타임라인에서 비교할 A와 B 버전을 지정하세요.",
+    "snapshot_options": "스냅샷 옵션",
+    "version_name": "버전 이름:",
+    "pin_important": "중요 버전으로 고정",
+    "edit_version_metadata": "버전 정보 수정…",
     "hd_deleted_banner": (
         "이 시점에 노트가 삭제되었습니다. 삭제 직전 내용은 아래 "
         "'새 노트로 복원'으로 되살릴 수 있습니다."
@@ -402,7 +481,7 @@ _KO = {
     "media_baseline_progress_label": "미디어: {done} / {total} 파일",
     "media_baseline_done": "미디어 베이스라인 완료 ({count}개 파일).",
     # Maintenance
-    "menu_full_rescan": "전체 재검사",
+    "menu_full_rescan": "기록 누락 검사·복구…",
     "rescan_needs_baseline": (
         "전체 재검사는 전체 베이스라인을 먼저 실행한 뒤 사용할 수 있습니다 "
         "(도구 → 전체 컬렉션 베이스라인 만들기)."
@@ -410,7 +489,7 @@ _KO = {
     "rescan_progress": "모든 노트 재검사 중…",
     "rescan_progress_label": "재검사: {done} / {total} 노트",
     "rescan_done": "전체 재검사 완료: 변경 {captured}건 캡처.",
-    "menu_compact": "데이터베이스 압축",
+    "menu_compact": "DB 여유 공간 회수…",
     "compact_progress": "버전 기록 압축 중…",
     "compact_done": "압축 완료. 사용되지 않는 저장 파일 {blobs}개를 제거했습니다.",
 }

@@ -22,6 +22,7 @@ import os
 import sqlite3
 import time
 import unicodedata
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -213,46 +214,67 @@ def restore_media_file(
     media_dir = Path(col.media.dir())
     target = media_dir / fname
     key = _nfc(fname)
+    media_dir.mkdir(parents=True, exist_ok=True)
 
-    conn.execute("BEGIN IMMEDIATE")
+    # All potentially slow file reads/copies happen before the DB lock. The
+    # prior content is kept in the blob store as a compensation source.
+    existed = target.is_file()
+    current_sha1 = ""
+    current_size = 0
+    if existed:
+        current_sha1, current_size = blobs.put_file(target)
+    stage = media_dir / f".nvh-stage-{uuid.uuid4().hex}"
+    size = blobs.copy_to(sha1, stage)
+    replaced = False
     try:
-        existed = target.is_file()
-        if existed:
-            current_sha1, current_size = blobs.put_file(target)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             manifest = _load_manifest(conn)
-            known = manifest.get(key)
-            if known is None or known[0] != current_sha1:
-                conn.execute(
-                    _INSERT_EVENT_SQL,
-                    (
-                        key,
-                        resolved_now,
-                        consts.ORIGIN_RESTORE,
-                        consts.EVENT_MODIFIED if known is not None else consts.EVENT_ADDED,
-                        current_sha1,
-                        current_size,
-                    ),
-                )
-        size = blobs.copy_to(sha1, target)  # stream blob → exact original name
-        conn.execute(
-            _INSERT_EVENT_SQL,
-            (
-                key,
-                resolved_now,
-                consts.ORIGIN_RESTORE,
-                consts.EVENT_MODIFIED if existed else consts.EVENT_ADDED,
-                sha1,
-                size,
-            ),
-        )
-        conn.execute(
-            _UPSERT_MANIFEST_SQL,
-            (key, sha1, size, int(target.stat().st_mtime * 1000)),
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+            if existed:
+                known = manifest.get(key)
+                if known is None or known[0] != current_sha1:
+                    conn.execute(
+                        _INSERT_EVENT_SQL,
+                        (
+                            key,
+                            resolved_now,
+                            consts.ORIGIN_RESTORE,
+                            consts.EVENT_MODIFIED
+                            if known is not None
+                            else consts.EVENT_ADDED,
+                            current_sha1,
+                            current_size,
+                        ),
+                    )
+            os.replace(stage, target)
+            replaced = True
+            conn.execute(
+                _INSERT_EVENT_SQL,
+                (
+                    key,
+                    resolved_now,
+                    consts.ORIGIN_RESTORE,
+                    consts.EVENT_MODIFIED if existed else consts.EVENT_ADDED,
+                    sha1,
+                    size,
+                ),
+            )
+            conn.execute(
+                _UPSERT_MANIFEST_SQL,
+                (key, sha1, size, int(target.stat().st_mtime * 1000)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if replaced:
+                if existed:
+                    blobs.copy_to(current_sha1, target)
+                else:
+                    target.unlink(missing_ok=True)
+            raise
+    finally:
+        stage.unlink(missing_ok=True)
 
 
 def list_media_events(conn: sqlite3.Connection, fname: str) -> list[MediaEvent]:

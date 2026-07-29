@@ -26,11 +26,21 @@ version.
   full-sync download the add-on rescans automatically to stay consistent.
 - **Lazy by default** — no forced first-run baseline. A note's "before" state is
   captured when you open it in the editor, and recorded the first time you
-  change the note. You can baseline the whole collection on demand instead.
+  change the note. On profile open the add-on offers (once) to baseline the
+  whole collection — declining just leaves that option in the Tools menu.
 - **Per-field diff & restore** — restore a whole version or selected fields.
   Restores are themselves undoable (Ctrl+Z) and recorded (append-only history).
+- **Advanced timelines** — search/filter 100-row pages, compare any two
+  versions as A→B (even across pages), and compare fields/tags or
+  templates/CSS by name.
+- **Named, pinned snapshots** — name snapshots and pin important versions.
+  Pinned automatic versions are protected from pruning; manual snapshots
+  remain permanent after unpinning.
 - **Note types** — colored diffs of card templates and CSS; restore templates +
   CSS **without** touching the field schema (so no forced full sync).
+- **Stable profile storage** — history follows profile renames. *Reconnect
+  Previous Profile History…* reconnects an orphaned older DB without merging
+  or deleting directories.
 - **Retention & maintenance** — configurable pruning and a compact command to
   reclaim space.
 - **English / 한국어** UI (follows Anki's language).
@@ -56,17 +66,23 @@ In Anki: **Tools → Add-ons → Get Add-ons…**, then paste the code
   History…**, or the **🕘** button inside the card-type editor.
 - **Full baseline** (optional, for complete coverage) — Tools → *Note Version
   History* → **Baseline Entire Collection…**.
-- Diff modes in each dialog: *show this version only*, *compare with current*,
-  and *compare with previous version* (the default; your last choice is
-  remembered).
+- Search version names, operations, origins, and tags; optionally include note
+  fields or note-type templates/CSS. Filters cover automatic, sync, snapshot,
+  restore, baseline, deletion, and pinned rows.
+- Select *Compare specified versions (A→B)* to reveal **Set A**, **Set B**,
+  swap, and clear controls for an arbitrary comparison across pages and
+  filters. Other comparison modes ignore the retained A/B endpoints. Browser
+  bulk snapshots apply one name/pin choice to all selected notes in a
+  background, chunked job.
 
 ## How it works
 
 Anki exposes no "before an edit" hook, so the add-on caches a note's state when
 it loads in the editor and records that as the baseline the first time the note
-actually changes. Everything lives in a per-profile SQLite database under the
-add-on's `user_files/`; the collection is only ever read, and all restores go
-through Anki's public, undoable APIs.
+actually changes. Everything lives in a schema-v2 SQLite database under the
+add-on's `user_files/`. Notes are identified by Anki GUID, and an add-on storage
+key keeps the DB attached through profile renames. The collection is only ever
+read directly, and restores use Anki's public, undoable APIs.
 
 ## Development
 

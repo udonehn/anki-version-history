@@ -14,6 +14,7 @@ EXPECTED_TABLES = {
     "note_index",
     "notetype_index",
     "media_manifest",
+    "note_scan_boundary",
 }
 
 
@@ -101,3 +102,55 @@ def test_media_event_check_constraint_enforced(conn):
             "INSERT INTO media_events (fname, ts, origin, event, sha1, size)"
             " VALUES ('a.mp3', 0, 'auto', 'renamed', 'abc', 1)"
         )
+
+
+def test_v1_to_v2_migration_preserves_rows_ids_and_index(tmp_db_path):
+    connection = sqlite3.connect(str(tmp_db_path), isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    db._create_v1(connection)  # noqa: SLF001 - construct a released v1 fixture
+    db.meta_set(connection, consts.META_SCHEMA_VERSION, "1")
+    connection.execute(
+        "INSERT INTO note_versions"
+        " (id,nid,guid,mid,ts,origin,op_label,fields,field_names,tags,hash)"
+        " VALUES (42,7,'guid-7',9,10,'auto','edit','[\"x\"]','[\"Front\"]','[]','h')"
+    )
+    connection.execute(
+        "INSERT INTO note_index(nid,guid,latest_hash,latest_version,alive)"
+        " VALUES (7,'guid-7','h',42,1)"
+    )
+    connection.close()
+
+    migrated = db.open_history_db(tmp_db_path)
+    try:
+        row = migrated.execute("select * from note_versions where id=42").fetchone()
+        assert row["fields"] == '["x"]'
+        assert row["user_label"] == ""
+        assert row["pinned"] == 0
+        index = migrated.execute("select * from note_index").fetchone()
+        assert index["identity"] == "g:guid-7"
+        assert index["latest_version"] == 42
+    finally:
+        migrated.close()
+
+
+def test_interrupted_v2_transaction_can_be_reopened(tmp_db_path):
+    connection = sqlite3.connect(str(tmp_db_path), isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    db._create_v1(connection)  # noqa: SLF001
+    db.meta_set(connection, consts.META_SCHEMA_VERSION, "1")
+    connection.execute("BEGIN IMMEDIATE")
+    db._create_v2(connection)  # noqa: SLF001
+    connection.execute("ROLLBACK")
+    assert "identity" not in {
+        row["name"] for row in connection.execute("pragma table_info(note_index)")
+    }
+    connection.close()
+
+    reopened = db.open_history_db(tmp_db_path)
+    try:
+        assert db.meta_get(reopened, consts.META_SCHEMA_VERSION) == "2"
+        assert "identity" in {
+            row["name"] for row in reopened.execute("pragma table_info(note_index)")
+        }
+    finally:
+        reopened.close()

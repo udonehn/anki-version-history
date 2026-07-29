@@ -27,9 +27,12 @@ _PRUNE_NOTES_SQL = """
 DELETE FROM note_versions WHERE id IN (
   SELECT id FROM (
     SELECT id, ts,
-           row_number() OVER (PARTITION BY nid ORDER BY id DESC) AS rn
+           row_number() OVER (
+             PARTITION BY CASE WHEN guid <> '' THEN 'g:' || guid ELSE 'n:' || nid END
+             ORDER BY id DESC
+           ) AS rn
     FROM note_versions
-    WHERE origin = 'auto' AND deleted = 0
+    WHERE origin = 'auto' AND deleted = 0 AND pinned = 0
   )
   WHERE rn > 1 AND (rn > :max_per OR (:cutoff > 0 AND ts < :cutoff))
 )
@@ -57,7 +60,7 @@ def maintenance_due(conn: sqlite3.Connection, now_ms: int | None = None) -> bool
 
 def run_maintenance(
     conn: sqlite3.Connection,
-    blobs: BlobStore,
+    blobs: BlobStore | None,
     retention: RetentionConfig,
     *,
     now_ms: int | None = None,
@@ -65,12 +68,16 @@ def run_maintenance(
     """Prune + GC + incremental vacuum; stamps the last-run marker."""
     resolved_now = now_ms if now_ms is not None else _now_ms()
     notes_pruned = prune_note_versions(conn, retention, now_ms=resolved_now)
-    media_pruned = prune_media_events(conn, retention, now_ms=resolved_now)
+    media_pruned = (
+        prune_media_events(conn, retention, now_ms=resolved_now)
+        if blobs is not None
+        else 0
+    )
     # Always GC: rolled-back captures can orphan blobs even when no media event
     # is pruned, so gating on media_pruned would leak them forever (the default
     # media_max_age_days=0 means media pruning never fires). The blob store's own
     # age guard keeps this safe against in-flight writes.
-    blobs_removed = gc_blobs(conn, blobs)
+    blobs_removed = gc_blobs(conn, blobs) if blobs is not None else 0
     incremental_vacuum(conn)
     db.meta_set(conn, consts.META_LAST_PRUNE_MS, str(resolved_now))
     return MaintenanceReport(

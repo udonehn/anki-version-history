@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from anki.collection import Collection
 from anki.errors import NotFoundError
 
-from . import consts, db, hashing
+from . import consts, db, hashing, timeline
 from .records import NoteVersion
 
 DEFAULT_CHUNK_SIZE = 1000
@@ -35,14 +35,16 @@ DELETED_HASH = "__deleted__"
 
 _INSERT_VERSION_SQL = (
     "INSERT INTO note_versions"
-    " (nid, guid, mid, ts, origin, op_label, fields, field_names, tags, hash, deleted)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " (nid, guid, mid, ts, origin, op_label, fields, field_names, tags, hash,"
+    " deleted, user_label, pinned)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 _UPSERT_INDEX_SQL = (
-    "INSERT INTO note_index (nid, guid, latest_hash, latest_version, alive)"
-    " VALUES (?, ?, ?, ?, ?)"
-    " ON CONFLICT(nid) DO UPDATE SET guid=excluded.guid,"
+    "INSERT INTO note_index"
+    " (identity, nid, guid, latest_hash, latest_version, alive)"
+    " VALUES (?, ?, ?, ?, ?, ?)"
+    " ON CONFLICT(identity) DO UPDATE SET nid=excluded.nid, guid=excluded.guid,"
     " latest_hash=excluded.latest_hash, latest_version=excluded.latest_version,"
     " alive=excluded.alive"
 )
@@ -180,22 +182,47 @@ def snapshot_notes(
     *,
     origin: str = consts.ORIGIN_MANUAL,
     op_label: str = "",
+    user_label: str = "",
+    pinned: bool = True,
     now_ms: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    progress: Callable[[int, int], None] | None = None,
 ) -> int:
     """Manual/restore snapshot: always inserts (dedupe bypassed) — these are
     user-pinned rows. Returns the number of notes snapshotted."""
     resolved_now = now_ms if now_ms is not None else _now_ms()
     ctx = NoteScanContext(origin=origin, op_label=op_label, now_ms=resolved_now)
+    resolved_nids = [int(nid) for nid in nids]
     count = 0
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        for nid in nids:
-            if capture_note(col, conn, int(nid), ctx, resolved_now, force=True):
-                count += 1
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    done = 0
+    for chunk in _chunks(resolved_nids, max(1, int(chunk_size))):
+        states = [
+            state
+            for state in (
+                read_note_state(col, int(nid), ctx.exclude_mids) for nid in chunk
+            )
+            if state is not None
+        ]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for state in states:
+                if write_note_state(
+                    conn,
+                    state,
+                    ctx,
+                    resolved_now,
+                    force=True,
+                    user_label=user_label,
+                    pinned=pinned,
+                ):
+                    count += 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        done += len(chunk)
+        if progress is not None:
+            progress(done, len(resolved_nids))
     return count
 
 
@@ -232,14 +259,18 @@ def write_note_state(
     now_ms: int,
     *,
     force: bool,
+    user_label: str = "",
+    pinned: bool = False,
 ) -> bool:
     """Append a version row for ``state`` if it differs from the latest stored
     version (or unconditionally when ``force``). Caller owns the transaction.
     The ``note_index`` re-check happens HERE, inside the write transaction, so a
     concurrent scan that already captured this content is deduped correctly.
     Returns True when a row was inserted."""
+    identity = db.note_identity(state.nid, state.guid)
     index_row = conn.execute(
-        "select latest_hash, alive from note_index where nid=?", (state.nid,)
+        "select nid, latest_hash, alive from note_index where identity=?",
+        (identity,),
     ).fetchone()
     is_unchanged = (
         index_row is not None
@@ -247,7 +278,28 @@ def write_note_state(
         and index_row["alive"] == 1
     )
     if is_unchanged and not force:
+        if int(index_row["nid"]) != state.nid:
+            conn.execute(
+                "UPDATE note_index SET nid=?, guid=? WHERE identity=?",
+                (state.nid, state.guid, identity),
+            )
         return False
+    conflicts = conn.execute(
+        "SELECT nid, guid FROM note_index "
+        "WHERE nid=? AND identity<>? AND alive=1",
+        (state.nid, identity),
+    ).fetchall()
+    replacement_ctx = replace(
+        ctx, op_label=ctx.op_label or consts.LABEL_DELETE_NOTE
+    )
+    for conflict in conflicts:
+        _insert_deletion_marker(
+            conn,
+            int(conflict["nid"]),
+            str(conflict["guid"]),
+            replacement_ctx,
+            now_ms,
+        )
     # Lazy baseline: the first time we ever record this note, if we cached its
     # pre-edit state (from editor load) and it differs, store that as the
     # 'baseline' so the change we're about to record stays restorable.
@@ -266,9 +318,14 @@ def write_note_state(
         field_names=state.field_names,
         tags=state.tags,
         hash=state.hash,
+        user_label=timeline.normalized_label(user_label),
+        pinned=pinned,
     )
     version_id = _insert_version(conn, version)
-    conn.execute(_UPSERT_INDEX_SQL, (state.nid, state.guid, state.hash, version_id, 1))
+    conn.execute(
+        _UPSERT_INDEX_SQL,
+        (identity, state.nid, state.guid, state.hash, version_id, 1),
+    )
     return True
 
 
@@ -358,6 +415,7 @@ def full_rescan(
         max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
         db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod))
         db.meta_set(conn, consts.META_LAST_NOTE_COUNT, str(total))
+        conn.execute("DELETE FROM note_scan_boundary")
     return NoteScanReport(
         captured=captured,
         deleted=deleted,
@@ -376,7 +434,7 @@ def rescan_indexed(
 ) -> NoteScanReport:
     """Lazy-mode heal for a full-sync download when NO baseline exists: re-hash
     only the notes we already track (``note_index``), run the deletion diff, and
-    re-anchor the marker to the collection's current max mod + 1.
+    re-anchor the marker with a same-second boundary.
 
     Unlike :func:`full_rescan` it deliberately does NOT hash-compare untracked
     notes — that would dump the whole pre-existing collection as 'auto' rows,
@@ -398,13 +456,7 @@ def rescan_indexed(
         touched.update(chunk_nids)
     deleted, resurrected, back_nids = _diff_deletions(col, conn, ctx, resolved_now)
     touched |= back_nids
-    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
-    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 1))
-    db.meta_set(
-        conn,
-        consts.META_LAST_NOTE_COUNT,
-        str(int(col.db.scalar("select count(*) from notes"))),
-    )
+    initialize_lazy_boundary(col, conn)
     return NoteScanReport(
         captured=captured,
         deleted=deleted,
@@ -413,14 +465,160 @@ def rescan_indexed(
     )
 
 
-def list_note_versions(conn: sqlite3.Connection, nid: int) -> list[NoteVersion]:
-    """All stored versions of a note, newest first."""
+def list_note_versions(
+    conn: sqlite3.Connection, nid: int, guid: str | None = None
+) -> list[NoteVersion]:
+    """All stored versions of one logical note, newest first."""
+    predicate, params = _note_predicate(conn, nid, guid)
     rows = conn.execute(
-        "select id, nid, guid, mid, ts, origin, op_label, fields, field_names,"
-        " tags, hash, deleted from note_versions where nid=? order by id desc",
-        (nid,),
+        f"{_NOTE_SELECT} WHERE {predicate} ORDER BY id DESC", params
     ).fetchall()
     return [_row_to_version(row) for row in rows]
+
+
+def get_note_version(
+    conn: sqlite3.Connection, version_id: int
+) -> NoteVersion | None:
+    row = conn.execute(
+        f"{_NOTE_SELECT} WHERE id=?", (int(version_id),)
+    ).fetchone()
+    return _row_to_version(row) if row is not None else None
+
+
+def get_previous_note_version(
+    conn: sqlite3.Connection, version_id: int
+) -> NoteVersion | None:
+    return get_adjacent_note_version(conn, version_id, older=True)
+
+
+def get_adjacent_note_version(
+    conn: sqlite3.Connection, version_id: int, *, older: bool
+) -> NoteVersion | None:
+    current = get_note_version(conn, version_id)
+    if current is None:
+        return None
+    predicate, params = _note_predicate(conn, current.nid, current.guid)
+    operator = "<" if older else ">"
+    order = "DESC" if older else "ASC"
+    row = conn.execute(
+        f"{_NOTE_SELECT} WHERE {predicate} AND id{operator}? "
+        f"ORDER BY id {order} LIMIT 1",
+        (*params, int(version_id)),
+    ).fetchone()
+    return _row_to_version(row) if row is not None else None
+
+
+def get_deleted_restore_source(
+    conn: sqlite3.Connection, deletion_version_id: int
+) -> NoteVersion | None:
+    """Nearest older content row in the same logical note timeline."""
+    source = get_previous_note_version(conn, deletion_version_id)
+    while source is not None and source.deleted and source.id is not None:
+        source = get_previous_note_version(conn, source.id)
+    return source
+
+
+def page_note_versions(
+    conn: sqlite3.Connection,
+    nid: int,
+    filter_: timeline.TimelineFilter = timeline.TimelineFilter(),
+    *,
+    guid: str | None = None,
+    offset: int = 0,
+) -> timeline.VersionPage[NoteVersion]:
+    predicate, params = _note_predicate(conn, nid, guid)
+    clauses = [predicate]
+    category, category_params = timeline.category_clause(filter_.category)
+    if category:
+        clauses.append(category)
+        params.extend(category_params)
+    if filter_.pinned_only:
+        clauses.append("pinned=1")
+    if filter_.search:
+        pattern = timeline.like_pattern(filter_.search.casefold())
+        searchable = [
+            "lower(user_label) LIKE ? ESCAPE '\\'",
+            "lower(op_label) LIKE ? ESCAPE '\\'",
+            "lower(origin) LIKE ? ESCAPE '\\'",
+            "lower(tags) LIKE ? ESCAPE '\\'",
+        ]
+        search_params: list[object] = [pattern] * len(searchable)
+        if filter_.include_content:
+            searchable.extend(
+                [
+                    "lower(fields) LIKE ? ESCAPE '\\'",
+                    "lower(field_names) LIKE ? ESCAPE '\\'",
+                ]
+            )
+            search_params.extend([pattern, pattern])
+        clauses.append("(" + " OR ".join(searchable) + ")")
+        params.extend(search_params)
+    where = " AND ".join(clauses)
+    total = int(
+        conn.execute(
+            f"SELECT count(*) FROM note_versions WHERE {where}", params
+        ).fetchone()[0]
+    )
+    resolved_offset = max(0, int(offset))
+    rows = conn.execute(
+        f"{_NOTE_SELECT} WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        (*params, timeline.PAGE_SIZE, resolved_offset),
+    ).fetchall()
+    return timeline.VersionPage(
+        items=tuple(_row_to_version(row) for row in rows),
+        total=total,
+        offset=resolved_offset,
+    )
+
+
+def update_note_annotation(
+    conn: sqlite3.Connection,
+    version_id: int,
+    *,
+    user_label: str,
+    pinned: bool,
+) -> bool:
+    return timeline.update_annotation(
+        conn,
+        "note_versions",
+        version_id,
+        user_label=user_label,
+        pinned=pinned,
+    )
+
+
+def initialize_lazy_boundary(
+    col: Collection, conn: sqlite3.Connection
+) -> int:
+    """Anchor lazy capture without losing real edits in the current second."""
+    max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
+    nids = col.db.list("select id from notes where mod=? order by id", max_mod)
+    states = [
+        state
+        for state in (
+            read_note_state(col, int(nid), frozenset()) for nid in nids
+        )
+        if state is not None
+    ]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM note_scan_boundary")
+        conn.executemany(
+            "INSERT INTO note_scan_boundary(nid, guid, hash, mod)"
+            " VALUES (?, ?, ?, ?)",
+            [(state.nid, state.guid, state.hash, max_mod) for state in states],
+        )
+        db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod))
+        db.meta_set(
+            conn,
+            consts.META_LAST_NOTE_COUNT,
+            str(int(col.db.scalar("select count(*) from notes"))),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return max_mod
 
 
 # --- internals ---
@@ -453,19 +651,24 @@ def _process_marker_chunk(
     and is re-queued by the next ``mod >= marker`` scan. Returns
     (marker, captured_nids)."""
     chunk_marker = marker
-    states: list[NoteReadState] = []
+    states: list[tuple[NoteReadState, int]] = []
     for nid, mod in chunk:
         state = read_note_state(col, int(nid), ctx.exclude_mids)
         if state is not None:
-            states.append(state)
+            states.append((state, int(mod)))
         chunk_marker = max(chunk_marker, int(mod))
     captured_nids: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for state in states:
+        for state, state_mod in states:
+            if _matches_lazy_boundary(conn, state, state_mod):
+                continue
             if write_note_state(conn, state, ctx, now_ms, force=False):
                 captured_nids.append(state.nid)
         db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(chunk_marker))
+        conn.execute(
+            "DELETE FROM note_scan_boundary WHERE mod < ?", (chunk_marker,)
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -510,18 +713,40 @@ def _diff_deletions(
     """Set-diff note_index against the collection: emit deletion marker rows
     for vanished notes and force-capture resurrected ones (undo of a delete
     brings a note back with its ORIGINAL mod — invisible to the marker)."""
-    current_nids = {int(nid) for nid in col.db.list("select id from notes")}
-    known = conn.execute("select nid, guid, alive from note_index").fetchall()
-    dead = [(row["nid"], row["guid"]) for row in known
-            if row["alive"] == 1 and row["nid"] not in current_nids]
-    back = [row["nid"] for row in known
-            if row["alive"] == 0 and row["nid"] in current_nids]
+    current = {
+        db.note_identity(int(nid), str(guid)): int(nid)
+        for nid, guid in col.db.all("select id, guid from notes")
+    }
+    known = conn.execute(
+        "select identity, nid, guid, alive from note_index"
+    ).fetchall()
+    dead = [
+        (row["nid"], row["guid"])
+        for row in known
+        if row["alive"] == 1 and row["identity"] not in current
+    ]
+    back = [
+        current[row["identity"]]
+        for row in known
+        if row["alive"] == 0 and row["identity"] in current
+    ]
+    moved = [
+        (row["identity"], current[row["identity"]])
+        for row in known
+        if row["alive"] == 1
+        and row["identity"] in current
+        and int(row["nid"]) != current[row["identity"]]
+    ]
 
     delete_ctx = replace(ctx, op_label=ctx.op_label or consts.LABEL_DELETE_NOTE)
     revive_ctx = replace(ctx, op_label=ctx.op_label or consts.LABEL_UNDO_DELETE)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        for identity, nid in moved:
+            conn.execute(
+                "UPDATE note_index SET nid=? WHERE identity=?", (nid, identity)
+            )
         for nid, guid in dead:
             _insert_deletion_marker(conn, nid, guid, delete_ctx, now_ms)
         revived: set[int] = set()
@@ -550,14 +775,26 @@ def _insert_before_baseline(conn: sqlite3.Connection, nid: int, before: BeforeSt
         hash=before.hash,
     )
     version_id = _insert_version(conn, version)
-    conn.execute(_UPSERT_INDEX_SQL, (nid, before.guid, before.hash, version_id, 1))
+    conn.execute(
+        _UPSERT_INDEX_SQL,
+        (
+            db.note_identity(nid, before.guid),
+            nid,
+            before.guid,
+            before.hash,
+            version_id,
+            1,
+        ),
+    )
 
 
 def _insert_deletion_marker(
     conn: sqlite3.Connection, nid: int, guid: str, ctx: NoteScanContext, now_ms: int
 ) -> None:
+    predicate, params = _identity_predicate(nid, guid)
     last_mid = conn.execute(
-        "select mid from note_versions where nid=? order by id desc limit 1", (nid,)
+        f"select mid from note_versions where {predicate} order by id desc limit 1",
+        params,
     ).fetchone()
     version = NoteVersion(
         nid=nid,
@@ -573,7 +810,17 @@ def _insert_deletion_marker(
         deleted=True,
     )
     version_id = _insert_version(conn, version)
-    conn.execute(_UPSERT_INDEX_SQL, (nid, guid, DELETED_HASH, version_id, 0))
+    conn.execute(
+        _UPSERT_INDEX_SQL,
+        (
+            db.note_identity(nid, guid),
+            nid,
+            guid,
+            DELETED_HASH,
+            version_id,
+            0,
+        ),
+    )
 
 
 def _insert_version(conn: sqlite3.Connection, version: NoteVersion) -> int:
@@ -591,6 +838,8 @@ def _insert_version(conn: sqlite3.Connection, version: NoteVersion) -> int:
             _dump(version.tags),
             version.hash,
             1 if version.deleted else 0,
+            timeline.normalized_label(version.user_label),
+            1 if version.pinned else 0,
         ),
     )
     return int(cursor.lastrowid)
@@ -610,8 +859,52 @@ def _row_to_version(row: sqlite3.Row) -> NoteVersion:
         tags=tuple(json.loads(row["tags"])),
         hash=row["hash"],
         deleted=bool(row["deleted"]),
+        user_label=row["user_label"],
+        pinned=bool(row["pinned"]),
     )
 
 
 def _dump(values: Iterable[str]) -> str:
     return json.dumps(list(values), ensure_ascii=False)
+
+
+_NOTE_SELECT = (
+    "SELECT id, nid, guid, mid, ts, origin, op_label, fields, field_names,"
+    " tags, hash, deleted, user_label, pinned FROM note_versions"
+)
+
+
+def _identity_predicate(nid: int, guid: str) -> tuple[str, list[object]]:
+    if guid:
+        return "guid=?", [guid]
+    return "guid='' AND nid=?", [int(nid)]
+
+
+def _note_predicate(
+    conn: sqlite3.Connection, nid: int, guid: str | None
+) -> tuple[str, list[object]]:
+    if guid is not None:
+        return _identity_predicate(nid, guid)
+    row = conn.execute(
+        "SELECT guid FROM note_index WHERE nid=? "
+        "ORDER BY alive DESC, latest_version DESC LIMIT 1",
+        (int(nid),),
+    ).fetchone()
+    if row is not None:
+        return _identity_predicate(nid, str(row["guid"]))
+    return "nid=?", [int(nid)]
+
+
+def _matches_lazy_boundary(
+    conn: sqlite3.Connection, state: NoteReadState, state_mod: int
+) -> bool:
+    row = conn.execute(
+        "SELECT guid, hash, mod FROM note_scan_boundary WHERE nid=?",
+        (state.nid,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and str(row["guid"]) == state.guid
+        and str(row["hash"]) == state.hash
+        and int(row["mod"]) == state_mod
+    )

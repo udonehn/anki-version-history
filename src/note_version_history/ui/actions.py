@@ -12,10 +12,10 @@ import json
 from collections.abc import Callable, Iterable
 
 from aqt import mw
-from aqt.operations import CollectionOp
+from aqt.operations import CollectionOp, QueryOp
 from aqt.utils import showWarning, tooltip
 
-from .. import capture_notes, capture_notetypes, consts, restore, scheduler
+from .. import capture_notes, capture_notetypes, consts, db, restore, scheduler
 from ..i18n import tr
 from ..records import NotetypeVersion, NoteVersion
 
@@ -26,6 +26,9 @@ def restore_note_version(
     only_fields: set[str] | None,
     on_done: Callable[[], None] | None = None,
 ) -> None:
+    rt_token = scheduler.runtime()
+    if rt_token is None:
+        return
     outcome: dict = {}
 
     def op(col):
@@ -36,6 +39,8 @@ def restore_note_version(
         return result.changes
 
     def on_success(_changes) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
         _record_restore_row(version.nid)
         result = outcome.get("result")
         if result is not None and result.skipped_fields:
@@ -49,8 +54,12 @@ def restore_note_version(
         if on_done is not None:
             on_done()
 
+    def on_failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            _on_restore_failure(exc)
+
     CollectionOp(parent=parent, op=op).success(on_success).failure(
-        _on_restore_failure
+        on_failure
     ).run_in_background(initiator=consts.RESTORE_INITIATOR)
 
 
@@ -60,6 +69,9 @@ def restore_deleted_as_new(
     deck_id: int,
     on_done: Callable[[], None] | None = None,
 ) -> None:
+    rt_token = scheduler.runtime()
+    if rt_token is None:
+        return
     outcome: dict = {}
 
     def op(col):
@@ -70,6 +82,8 @@ def restore_deleted_as_new(
         return result.changes
 
     def on_success(_changes) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
         new_nid = outcome.get("new_nid")
         if new_nid:
             _record_restore_row(int(new_nid))
@@ -77,8 +91,12 @@ def restore_deleted_as_new(
         if on_done is not None:
             on_done()
 
+    def on_failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            _on_restore_failure(exc)
+
     CollectionOp(parent=parent, op=op).success(on_success).failure(
-        _on_restore_failure
+        on_failure
     ).run_in_background(initiator=consts.RESTORE_INITIATOR)
 
 
@@ -87,6 +105,9 @@ def restore_notetype_version(
     version: NotetypeVersion,
     on_done: Callable[[], None] | None = None,
 ) -> None:
+    rt_token = scheduler.runtime()
+    if rt_token is None:
+        return
     outcome: dict = {}
 
     def op(col):
@@ -97,6 +118,8 @@ def restore_notetype_version(
         return result.changes
 
     def on_success(_changes) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
         _record_notetype_restore_row(version.mid)
         result = outcome.get("result")
         if result is not None and (result.missing_in_current or result.missing_in_stored):
@@ -112,8 +135,12 @@ def restore_notetype_version(
         if on_done is not None:
             on_done()
 
+    def on_failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            _on_restore_failure(exc)
+
     CollectionOp(parent=parent, op=op).success(on_success).failure(
-        _on_restore_failure
+        on_failure
     ).run_in_background(initiator=consts.RESTORE_INITIATOR)
 
 
@@ -166,32 +193,108 @@ def apply_notetype_version_into_clayout(clayout, version: NotetypeVersion) -> bo
     return refreshed
 
 
-def snapshot_notetype(mid: int) -> bool:
-    """Manual note type snapshot. Main thread, main connection."""
+def snapshot_notetype(
+    mid: int, *, user_label: str = "", pinned: bool = True, on_done=None
+) -> bool:
+    """Manual note type snapshot on the shared background mutation gate."""
     rt = scheduler.runtime()
     if rt is None or mw is None or mw.col is None:
         tooltip(tr("no_profile_open"))
         return False
-    # empty op_label → the timeline derives it from origin='manual'
-    done = capture_notetypes.snapshot_notetype(
-        mw.col, rt.conn, int(mid), op_label=""
-    )
-    if done:
-        tooltip(tr("ntd_snapshot_done"))
-    return done
+    if not scheduler.acquire_mutation(rt, "snapshot_notetype"):
+        return False
+    rt_token = rt
+    db_path = scheduler.profile_db_path(rt)
+
+    def op(col):
+        own = db.open_history_db(db_path)
+        try:
+            return capture_notetypes.snapshot_notetype(
+                col,
+                own,
+                int(mid),
+                op_label="",
+                user_label=user_label,
+                pinned=pinned,
+            )
+        finally:
+            own.close()
+
+    def success(done: bool) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
+        scheduler.release_mutation(rt_token, "snapshot_notetype")
+        if done:
+            tooltip(tr("ntd_snapshot_done"))
+        if on_done is not None:
+            on_done()
+        scheduler.request_scan(notes=True, notetypes=True)
+
+    def failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            scheduler.release_mutation(rt_token, "snapshot_notetype")
+            showWarning(tr("restore_failed", error=str(exc)))
+
+    QueryOp(parent=mw, op=op, success=success).failure(failure).run_in_background()
+    return True
 
 
-def snapshot_notes(nids: Iterable[int]) -> int:
-    """Manual snapshot from browser/editor. Main thread, main connection."""
+def snapshot_notes(
+    nids: Iterable[int],
+    *,
+    user_label: str = "",
+    pinned: bool = True,
+    on_done=None,
+) -> bool:
+    """Manual snapshot from browser/editor in chunked background work."""
     rt = scheduler.runtime()
     if rt is None or mw is None or mw.col is None:
         tooltip(tr("no_profile_open"))
-        return 0
-    count = capture_notes.snapshot_notes(
-        mw.col, rt.conn, [int(n) for n in nids], op_label=""
-    )
-    tooltip(tr("snapshot_done", count=count))
-    return count
+        return False
+    resolved_nids = tuple(int(n) for n in nids)
+    if not scheduler.acquire_mutation(rt, "snapshot_notes"):
+        return False
+    rt_token = rt
+    db_path = scheduler.profile_db_path(rt)
+
+    def report_progress(done: int, total: int) -> None:
+        mw.taskman.run_on_main(
+            lambda: mw.progress.update(value=done, max=total)
+        )
+
+    def op(col):
+        own = db.open_history_db(db_path)
+        try:
+            return capture_notes.snapshot_notes(
+                col,
+                own,
+                resolved_nids,
+                op_label="",
+                user_label=user_label,
+                pinned=pinned,
+                progress=report_progress,
+            )
+        finally:
+            own.close()
+
+    def success(count: int) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
+        scheduler.release_mutation(rt_token, "snapshot_notes")
+        tooltip(tr("snapshot_done", count=count))
+        if on_done is not None:
+            on_done()
+        scheduler.request_scan(notes=True)
+
+    def failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            scheduler.release_mutation(rt_token, "snapshot_notes")
+            showWarning(tr("restore_failed", error=str(exc)))
+
+    QueryOp(parent=mw, op=op, success=success).failure(failure).with_progress(
+        tr("snapshot_progress")
+    ).run_in_background()
+    return True
 
 
 def _record_restore_row(nid: int) -> None:
@@ -200,7 +303,12 @@ def _record_restore_row(nid: int) -> None:
     if rt is None or mw is None or mw.col is None:
         return
     capture_notes.snapshot_notes(
-        mw.col, rt.conn, [nid], origin=consts.ORIGIN_RESTORE, op_label=""
+        mw.col,
+        rt.conn,
+        [nid],
+        origin=consts.ORIGIN_RESTORE,
+        op_label="",
+        pinned=False,
     )
 
 
@@ -209,7 +317,12 @@ def _record_notetype_restore_row(mid: int) -> None:
     if rt is None or mw is None or mw.col is None:
         return
     capture_notetypes.snapshot_notetype(
-        mw.col, rt.conn, int(mid), origin=consts.ORIGIN_RESTORE, op_label=""
+        mw.col,
+        rt.conn,
+        int(mid),
+        origin=consts.ORIGIN_RESTORE,
+        op_label="",
+        pinned=False,
     )
 
 

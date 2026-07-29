@@ -23,12 +23,32 @@ def col(tmp_path):
     collection.close()
 
 
-def insert_note_version(conn, nid, *, origin="auto", ts=NOW_MS, deleted=0, hash_="h"):
+def insert_note_version(
+    conn,
+    nid,
+    *,
+    origin="auto",
+    ts=NOW_MS,
+    deleted=0,
+    hash_="h",
+    pinned=0,
+):
     cursor = conn.execute(
         "INSERT INTO note_versions"
-        " (nid, guid, mid, ts, origin, op_label, fields, field_names, tags, hash, deleted)"
-        " VALUES (?, 'g', 1, ?, ?, '', ?, ?, '[]', ?, ?)",
-        (nid, ts, origin, json.dumps(["f"]), json.dumps(["Front"]), hash_, deleted),
+        " (nid, guid, mid, ts, origin,op_label,fields,field_names,tags,hash,"
+        " deleted,pinned)"
+        " VALUES (?, ?, 1, ?, ?, '', ?, ?, '[]', ?, ?, ?)",
+        (
+            nid,
+            f"g-{nid}",
+            ts,
+            origin,
+            json.dumps(["f"]),
+            json.dumps(["Front"]),
+            hash_,
+            deleted,
+            pinned,
+        ),
     )
     return int(cursor.lastrowid)
 
@@ -82,6 +102,26 @@ def test_prune_never_touches_protected_origins(conn):
 
     assert pruned == 0
     assert count_versions(conn, 1) == 5
+
+
+def test_prune_protects_pinned_automatic_versions(conn):
+    for index in range(5):
+        insert_note_version(
+            conn,
+            1,
+            ts=NOW_MS - 5 + index,
+            pinned=1 if index == 0 else 0,
+        )
+    retention = RetentionConfig(max_auto_versions_per_note=1, max_age_days=0)
+    prune.prune_note_versions(conn, retention, now_ms=NOW_MS)
+
+    rows = conn.execute(
+        "select pinned, ts from note_versions where nid=1 order by id"
+    ).fetchall()
+    assert [(row["pinned"], row["ts"]) for row in rows] == [
+        (1, NOW_MS - 5),
+        (0, NOW_MS - 1),
+    ]
 
 
 def test_media_prune_disabled_by_default(conn):

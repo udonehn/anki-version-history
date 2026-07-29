@@ -1,6 +1,6 @@
 [project]
 name = "note-version-history"
-version = "1.0.0"
+version = "1.2.0"
 description = "Anki add-on: git-like version history for notes, note types (templates/CSS) and media"
 requires-python = ">=3.10"
 

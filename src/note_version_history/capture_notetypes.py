@@ -14,15 +14,15 @@ from dataclasses import dataclass
 
 from anki.collection import Collection
 
-from . import consts, hashing
+from . import consts, hashing, timeline
 from .records import NotetypeVersion
 
 DELETED_HASH = "__deleted__"
 
 _INSERT_VERSION_SQL = (
     "INSERT INTO notetype_versions"
-    " (mid, ts, origin, op_label, name, config, hash, deleted)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    " (mid, ts, origin, op_label, name, config, hash, deleted, user_label, pinned)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 _UPSERT_INDEX_SQL = (
@@ -85,6 +85,8 @@ def snapshot_notetype(
     *,
     origin: str = consts.ORIGIN_MANUAL,
     op_label: str = "",
+    user_label: str = "",
+    pinned: bool = True,
     now_ms: int | None = None,
 ) -> bool:
     """Manual snapshot of one notetype: always inserts (dedupe bypassed)."""
@@ -94,7 +96,16 @@ def snapshot_notetype(
     resolved_now = now_ms if now_ms is not None else int(time.time() * 1000)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        _insert_current(conn, int(mid), notetype, origin, op_label, resolved_now)
+        _insert_current(
+            conn,
+            int(mid),
+            notetype,
+            origin,
+            op_label,
+            resolved_now,
+            user_label=user_label,
+            pinned=pinned,
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -105,7 +116,8 @@ def snapshot_notetype(
 def list_notetype_versions(conn: sqlite3.Connection, mid: int) -> list[NotetypeVersion]:
     """All stored versions of a notetype, newest first."""
     rows = conn.execute(
-        "select id, mid, ts, origin, op_label, name, config, hash, deleted"
+        "select id, mid, ts, origin, op_label, name, config, hash, deleted,"
+        " user_label, pinned"
         " from notetype_versions where mid=? order by id desc",
         (mid,),
     ).fetchall()
@@ -120,9 +132,105 @@ def list_notetype_versions(conn: sqlite3.Connection, mid: int) -> list[NotetypeV
             config_json=row["config"],
             hash=row["hash"],
             deleted=bool(row["deleted"]),
+            user_label=row["user_label"],
+            pinned=bool(row["pinned"]),
         )
         for row in rows
     ]
+
+
+def get_notetype_version(
+    conn: sqlite3.Connection, version_id: int
+) -> NotetypeVersion | None:
+    row = conn.execute(
+        f"{_NOTETYPE_SELECT} WHERE id=?", (int(version_id),)
+    ).fetchone()
+    return _row_to_version(row) if row is not None else None
+
+
+def get_previous_notetype_version(
+    conn: sqlite3.Connection, version_id: int
+) -> NotetypeVersion | None:
+    return get_adjacent_notetype_version(conn, version_id, older=True)
+
+
+def get_adjacent_notetype_version(
+    conn: sqlite3.Connection, version_id: int, *, older: bool
+) -> NotetypeVersion | None:
+    current = get_notetype_version(conn, version_id)
+    if current is None:
+        return None
+    operator = "<" if older else ">"
+    order = "DESC" if older else "ASC"
+    row = conn.execute(
+        f"{_NOTETYPE_SELECT} WHERE mid=? AND id{operator}? "
+        f"ORDER BY id {order} LIMIT 1",
+        (current.mid, int(version_id)),
+    ).fetchone()
+    return _row_to_version(row) if row is not None else None
+
+
+def page_notetype_versions(
+    conn: sqlite3.Connection,
+    mid: int,
+    filter_: timeline.TimelineFilter = timeline.TimelineFilter(),
+    *,
+    offset: int = 0,
+) -> timeline.VersionPage[NotetypeVersion]:
+    clauses = ["mid=?"]
+    params: list[object] = [int(mid)]
+    category, category_params = timeline.category_clause(filter_.category)
+    if category:
+        clauses.append(category)
+        params.extend(category_params)
+    if filter_.pinned_only:
+        clauses.append("pinned=1")
+    if filter_.search:
+        pattern = timeline.like_pattern(filter_.search.casefold())
+        searchable = [
+            "lower(user_label) LIKE ? ESCAPE '\\'",
+            "lower(op_label) LIKE ? ESCAPE '\\'",
+            "lower(origin) LIKE ? ESCAPE '\\'",
+            "lower(name) LIKE ? ESCAPE '\\'",
+        ]
+        search_params: list[object] = [pattern] * len(searchable)
+        if filter_.include_content:
+            searchable.append("lower(config) LIKE ? ESCAPE '\\'")
+            search_params.append(pattern)
+        clauses.append("(" + " OR ".join(searchable) + ")")
+        params.extend(search_params)
+    where = " AND ".join(clauses)
+    total = int(
+        conn.execute(
+            f"SELECT count(*) FROM notetype_versions WHERE {where}", params
+        ).fetchone()[0]
+    )
+    resolved_offset = max(0, int(offset))
+    rows = conn.execute(
+        f"{_NOTETYPE_SELECT} WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        (*params, timeline.PAGE_SIZE, resolved_offset),
+    ).fetchall()
+    return timeline.VersionPage(
+        items=tuple(_row_to_version(row) for row in rows),
+        total=total,
+        offset=resolved_offset,
+    )
+
+
+def update_notetype_annotation(
+    conn: sqlite3.Connection,
+    version_id: int,
+    *,
+    user_label: str,
+    pinned: bool,
+) -> bool:
+    return timeline.update_annotation(
+        conn,
+        "notetype_versions",
+        version_id,
+        user_label=user_label,
+        pinned=pinned,
+    )
 
 
 # --- internals (caller owns the transaction) ---
@@ -152,6 +260,9 @@ def _insert_current(
     origin: str,
     op_label: str,
     now_ms: int,
+    *,
+    user_label: str = "",
+    pinned: bool = False,
 ) -> int:
     surface_hash = hashing.notetype_hash_from_dict(notetype)
     cursor = conn.execute(
@@ -165,6 +276,8 @@ def _insert_current(
             json.dumps(notetype, ensure_ascii=False),
             surface_hash,
             0,
+            timeline.normalized_label(user_label),
+            1 if pinned else 0,
         ),
     )
     version_id = int(cursor.lastrowid)
@@ -189,6 +302,30 @@ def _insert_deletion_marker(
             "",
             DELETED_HASH,
             1,
+            "",
+            0,
         ),
     )
     conn.execute(_UPSERT_INDEX_SQL, (mid, DELETED_HASH, int(cursor.lastrowid), 0))
+
+
+_NOTETYPE_SELECT = (
+    "SELECT id, mid, ts, origin, op_label, name, config, hash, deleted,"
+    " user_label, pinned FROM notetype_versions"
+)
+
+
+def _row_to_version(row: sqlite3.Row) -> NotetypeVersion:
+    return NotetypeVersion(
+        id=row["id"],
+        mid=row["mid"],
+        ts=row["ts"],
+        origin=row["origin"],
+        op_label=row["op_label"],
+        name=row["name"],
+        config_json=row["config"],
+        hash=row["hash"],
+        deleted=bool(row["deleted"]),
+        user_label=row["user_label"],
+        pinned=bool(row["pinned"]),
+    )

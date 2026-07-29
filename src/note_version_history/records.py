@@ -21,6 +21,8 @@ class NoteVersion:
     hash: str
     deleted: bool = False  # True = deletion marker row (fields empty)
     id: int | None = None  # DB row id once stored
+    user_label: str = ""
+    pinned: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,8 @@ class NotetypeVersion:
     hash: str  # hash of name + templates(name,qfmt,afmt) + css only
     deleted: bool = False
     id: int | None = None
+    user_label: str = ""
+    pinned: bool = False
 
 
 @dataclass(frozen=True)

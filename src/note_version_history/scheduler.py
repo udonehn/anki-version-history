@@ -40,41 +40,19 @@ from . import (
 from .appconfig import AddonConfig, config_from_dict
 from .blobstore import BlobStore
 from .capture_notes import NoteScanContext
+from .workqueue import PendingWork, heal_scope, retry_delay, shutdown_can_be_clean
 
 _RESCAN_DELAY_MS = 200
 _INITIAL_SCAN_DELAY_MS = 1500
 _SYNC_SCAN_DELAY_MS = 300
 _BEFORE_CACHE_MAX = 512
 _MAX_SCAN_FAILURES = 3
-
-
-@dataclass
-class PendingWork:
-    """Change flags accumulated by hooks between debounce firings."""
-
-    labels: list[str] = field(default_factory=list)
-    saw_undo: bool = False
-    want_notes: bool = False
-    want_notetypes: bool = False
-    force_deletion_diff: bool = False
-    recheck_nids: frozenset[int] = frozenset()
-
-    def consume(self) -> "PendingWork":
-        taken = PendingWork(
-            labels=list(self.labels),
-            saw_undo=self.saw_undo,
-            want_notes=self.want_notes,
-            want_notetypes=self.want_notetypes,
-            force_deletion_diff=self.force_deletion_diff,
-            recheck_nids=self.recheck_nids,
-        )
-        self.labels.clear()
-        self.saw_undo = False
-        self.want_notes = False
-        self.want_notetypes = False
-        self.force_deletion_diff = False
-        self.recheck_nids = frozenset()
-        return taken
+# Profile-open consent prompt: first fires after the catch-up scan (1.5s) and
+# the heal rescan (3s) have been scheduled; while Anki is busy (startup sync,
+# any progress window) it retries a few times, then defers to the next open.
+_PROFILE_OPEN_PROMPT_DELAY_MS = 4_000
+_PROFILE_OPEN_PROMPT_RETRY_MS = 5_000
+_PROFILE_OPEN_PROMPT_MAX_RETRIES = 6
 
 
 @dataclass
@@ -84,7 +62,7 @@ class Runtime:
     profile_name: str
     data_dir: Path
     conn: sqlite3.Connection  # MAIN THREAD ONLY
-    blobs: BlobStore
+    blobs: BlobStore | None
     unclean_shutdown: bool
     debounce: QTimer
     heartbeat: QTimer
@@ -106,6 +84,7 @@ class Runtime:
     # repeated-failure surfacing
     scan_failures: int = 0
     scan_warning_shown: bool = False
+    mutation_owner: str | None = None
 
 
 _runtime: Runtime | None = None
@@ -113,6 +92,29 @@ _runtime: Runtime | None = None
 
 def runtime() -> Runtime | None:
     return _runtime
+
+
+def mutation_busy(rt: Runtime | None = None) -> bool:
+    target = rt if rt is not None else _runtime
+    return target is not None and target.mutation_owner is not None
+
+
+def acquire_mutation(rt: Runtime, owner: str) -> bool:
+    if rt.mutation_owner is not None:
+        return False
+    rt.mutation_owner = owner
+    return True
+
+
+def release_mutation(rt: Runtime, owner: str) -> None:
+    if rt.mutation_owner == owner:
+        rt.mutation_owner = None
+
+
+def blob_store(rt: Runtime) -> BlobStore:
+    if rt.blobs is None:
+        rt.blobs = BlobStore(profiles.blobs_dir(rt.data_dir))
+    return rt.blobs
 
 
 def addon_dir() -> Path:
@@ -196,11 +198,14 @@ def request_full_rescan(on_done=None) -> bool:
     rt = _runtime
     if rt is None or mw is None or mw.col is None:
         return False
-    if rt.scan_running or rt.baseline_running or rt.full_rescan_pending:
+    if mutation_busy(rt) or rt.full_rescan_pending:
         rt.full_rescan_pending = True
         rt.pending_rescan_done = on_done
         return True
+    if not acquire_mutation(rt, "full_rescan"):
+        return False
     rt.scan_running = True
+    rt_token = rt
     baselined = baseline.notes_baseline_done(rt.conn)
     db_path = profile_db_path(rt)
 
@@ -226,23 +231,28 @@ def request_full_rescan(on_done=None) -> bool:
             own.close()
 
     def on_success(report) -> None:
-        current = _runtime
-        if current is not None:
-            current.scan_running = False
-            current.scan_failures = 0
-            # NB: deliberately NOT folding report.touched_nids into
-            # session_touched — a full rescan touches the whole collection, which
-            # would make every later undo re-check everything.
+        if _runtime is not rt_token:
+            return
+        rt_token.scan_running = False
+        rt_token.scan_failures = 0
+        release_mutation(rt_token, "full_rescan")
+        # NB: deliberately NOT folding report.touched_nids into
+        # session_touched — a full rescan touches the whole collection, which
+        # would make every later undo re-check everything.
         if on_done is not None:
             on_done(report)
         _drain_pending_scan()
 
     def on_failure(exc: BaseException) -> None:
-        current = _runtime
-        if current is not None:
-            current.scan_running = False
-        _note_scan_failure(exc, "full rescan")
-        _drain_pending_scan()
+        if _runtime is not rt_token:
+            return
+        rt_token.scan_running = False
+        release_mutation(rt_token, "full_rescan")
+        _note_scan_failure(exc, "full rescan", rt_token)
+        delay = _retry_delay(rt_token.scan_failures)
+        rt_token.full_rescan_pending = True
+        rt_token.pending_rescan_done = on_done
+        rt_token.debounce.start(delay)
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).with_progress(
         i18n.tr("rescan_progress")
@@ -259,13 +269,16 @@ def request_media_scan(on_done=None) -> bool:
         return False
     if rt is None or mw is None or mw.col is None:
         return False
-    if rt.baseline_running or rt.media_scan_running:
+    if mutation_busy(rt) or rt.media_scan_running:
         return False  # a baseline or another media scan owns the media DB now
     if baseline.media_baseline_state(rt.conn) != baseline.STATE_DONE:
         return False
     db_path = profile_db_path(rt)
     blobs_root = profiles.blobs_dir(rt.data_dir)
+    if not acquire_mutation(rt, "media_scan"):
+        return False
     rt.media_scan_running = True
+    rt_token = rt
 
     def op(col):
         own = db.open_history_db(db_path)
@@ -275,17 +288,21 @@ def request_media_scan(on_done=None) -> bool:
             own.close()
 
     def on_success(report) -> None:
-        current = _runtime
-        if current is not None:
-            current.media_scan_running = False
+        if _runtime is not rt_token:
+            return
+        rt_token.media_scan_running = False
+        release_mutation(rt_token, "media_scan")
         if on_done is not None:
             on_done(report)
+        _drain_pending_scan()
 
     def on_failure(exc: BaseException) -> None:
-        current = _runtime
-        if current is not None:
-            current.media_scan_running = False
+        if _runtime is not rt_token:
+            return
+        rt_token.media_scan_running = False
+        release_mutation(rt_token, "media_scan")
         print(f"note_version_history: media scan failed: {exc!r}")
+        _drain_pending_scan()
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).run_in_background()
     return True
@@ -301,13 +318,34 @@ def _on_profile_open() -> None:
     config = load_config()
     apply_language()
     profile_name = mw.pm.name
-    data_dir = profiles.profile_data_dir(user_files_dir(), profile_name)
+    conn: sqlite3.Connection | None = None
     try:
+        profile_prefs = getattr(mw.pm, "profile", None)
+        saved_key = (
+            profile_prefs.get(profiles.PROFILE_STORAGE_KEY)
+            if isinstance(profile_prefs, dict)
+            else None
+        )
+        storage_key, changed = profiles.choose_storage_key(
+            user_files_dir(), profile_name, saved_key
+        )
+        data_dir = profiles.profile_data_dir_for_key(
+            user_files_dir(), storage_key
+        )
         conn = db.open_history_db(profiles.history_db_path(data_dir))
+        if changed and isinstance(profile_prefs, dict):
+            profile_prefs[profiles.PROFILE_STORAGE_KEY] = storage_key
+            save_profile = getattr(mw.pm, "save", None)
+            if callable(save_profile):
+                save_profile()
     except db.HistoryDbTooNew:
+        if conn is not None:
+            conn.close()
         _show_warning(i18n.tr("db_too_new"))
         return
-    except (db.HistoryDbError, sqlite3.Error, OSError) as exc:
+    except Exception as exc:
+        if conn is not None:
+            conn.close()
         _show_warning(i18n.tr("db_open_failed", error=str(exc)))
         return
     unclean = db.meta_get(conn, consts.META_CLEAN_SHUTDOWN) == "0"
@@ -325,13 +363,13 @@ def _on_profile_open() -> None:
         profile_name=profile_name,
         data_dir=data_dir,
         conn=conn,
-        blobs=BlobStore(profiles.blobs_dir(data_dir)),
+        blobs=None,
         unclean_shutdown=unclean,
         debounce=debounce,
         heartbeat=heartbeat,
     )
     _runtime.prev_undo_status = _safe_undo_status()
-    unclean_heal = unclean and baseline.notes_baseline_done(conn)
+    unclean_heal = heal_scope(unclean, baseline.notes_baseline_done(conn))
 
     if config.heartbeat_scan_minutes > 0:
         heartbeat.start(config.heartbeat_scan_minutes * 60_000)
@@ -339,10 +377,11 @@ def _on_profile_open() -> None:
     # Lazy-baseline model: never capture the existing collection up front. A
     # fresh DB just records the capture start point (and baselines the few note
     # types); per-note baselines happen on first edit via the editor-load
-    # cache. Later opens do a catch-up scan for changes made while away.
+    # cache. Later opens do a catch-up scan for changes made while away. A
+    # one-time full-baseline offer is scheduled at the end of this function.
     if fresh and mw.col is not None:
         _init_lazy_install(_runtime.conn)
-    elif unclean_heal:
+    elif unclean_heal is not None:
         # A previous session died mid-flight: the full rescan hash-compares
         # everything and resets the marker, subsuming the catch-up scan — so
         # schedule ONLY it (both on the same connection would otherwise race).
@@ -356,9 +395,11 @@ def _on_profile_open() -> None:
         and _media_scan_stale(_runtime.conn)
     ):
         request_media_scan()
-    from .ui import baseline_wizard  # lazy: avoids import cycle
-
-    baseline_wizard.maybe_media_step()  # resume a pending media baseline only
+    rt_token = _runtime  # the lambda must not late-bind a newer profile's runtime
+    QTimer.singleShot(
+        _PROFILE_OPEN_PROMPT_DELAY_MS,
+        lambda: _maybe_profile_open_prompt(rt_token),
+    )
 
 
 def _media_scan_stale(conn: sqlite3.Connection) -> bool:
@@ -370,20 +411,42 @@ def _media_scan_stale(conn: sqlite3.Connection) -> bool:
     return now - last >= consts.MEDIA_SCAN_MIN_INTERVAL_MS
 
 
+def _maybe_profile_open_prompt(rt_token: Runtime, attempt: int = 0) -> None:
+    """Delayed profile-open consent prompt (first-run baseline offer, or the
+    media resume step). Deferred while Anki is busy — startup auto-sync, the
+    heal rescan, any progress window — and after a few retries it gives up for
+    this session; meta state is untouched, so the next open offers again.
+    ``rt_token`` pins the profile this chain was scheduled for: a profile
+    switch invalidates it (the new open schedules its own chain), so prompts
+    never double up."""
+    rt = _runtime
+    if rt is None or rt is not rt_token or mw is None or mw.col is None:
+        return
+    busy = (
+        rt.sync_active
+        or rt.scan_running
+        or rt.baseline_running
+        or rt.media_scan_running
+        or mw.progress.busy()
+    )
+    if busy:
+        if attempt < _PROFILE_OPEN_PROMPT_MAX_RETRIES:
+            QTimer.singleShot(
+                _PROFILE_OPEN_PROMPT_RETRY_MS,
+                lambda: _maybe_profile_open_prompt(rt_token, attempt + 1),
+            )
+        return
+    from .ui import baseline_wizard  # lazy: avoids import cycle
+
+    baseline_wizard.maybe_profile_open_prompt()
+
+
 def _init_lazy_install(conn: sqlite3.Connection) -> None:
     """Fresh DB: set the notes capture start point to 'now' so the pre-existing
     collection isn't captured wholesale (only notes edited from here on get a
     baseline, via the editor-load cache). Note types are few, so baseline them
     outright for full template/CSS coverage."""
-    max_mod = int(mw.col.db.scalar("select coalesce(max(mod), 0) from notes"))
-    count = int(mw.col.db.scalar("select count(*) from notes"))
-    # max_mod + 1 (not max_mod): the inclusive `mod >= marker` scan would else
-    # grab the single most-recently-modified note. Post-install edits always
-    # land in a later second than the collection's last pre-install edit, so
-    # excluding exactly max_mod loses nothing. (The running marker stays
-    # inclusive, preserving same-second re-edit capture.)
-    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod + 1))
-    db.meta_set(conn, consts.META_LAST_NOTE_COUNT, str(count))
+    capture_notes.initialize_lazy_boundary(mw.col, conn)
     try:
         capture_notetypes.scan_notetypes(
             mw.col, conn, origin=consts.ORIGIN_BASELINE, op_label=""
@@ -401,28 +464,41 @@ def _close_runtime() -> None:
     rt = _runtime
     if rt is None:
         return
+    clean = False
     try:
         rt.debounce.stop()
         rt.heartbeat.stop()
-        _final_scan_on_close(rt)
-        db.meta_set(rt.conn, consts.META_CLEAN_SHUTDOWN, "1")
-        rt.conn.close()
-    except sqlite3.Error:
-        pass  # closing must never block Anki shutdown
+        final_succeeded = False
+        if not mutation_busy(rt) and not rt.sync_active and not rt.full_rescan_pending:
+            final_succeeded = _final_scan_on_close(rt)
+        clean = shutdown_can_be_clean(
+            mutation_busy=mutation_busy(rt),
+            sync_active=rt.sync_active,
+            full_rescan_pending=rt.full_rescan_pending,
+            final_scan_succeeded=final_succeeded,
+        )
+        if clean:
+            db.meta_set(rt.conn, consts.META_CLEAN_SHUTDOWN, "1")
+    except Exception as exc:
+        print(f"note_version_history: profile close failed: {exc!r}")
     finally:
+        try:
+            rt.conn.close()
+        except sqlite3.Error:
+            pass
         _runtime = None
 
 
-def _final_scan_on_close(rt: Runtime) -> None:
+def _final_scan_on_close(rt: Runtime) -> bool:
     """Synchronous last scan (main thread, main connection): closes the
     "edit then immediately quit" debounce gap. Must never block shutdown."""
-    if rt.baseline_running:  # a full baseline is running; let it own capture
-        return
+    if rt.baseline_running or rt.scan_running or rt.media_scan_running:
+        return False
     if mw is None or mw.col is None:
-        return
+        return True
     config = load_config()
     if not config.auto_capture:
-        return
+        return True
     try:
         work = rt.pending.consume()
         ctx = _build_context(rt, work, config)
@@ -430,15 +506,17 @@ def _final_scan_on_close(rt: Runtime) -> None:
         capture_notetypes.scan_notetypes(mw.col, rt.conn, op_label=ctx.op_label)
         if consts.MEDIA_ENABLED and config.capture_media:
             capture_media.capture_files_for_notes(
-                mw.col, rt.conn, rt.blobs, report.touched_nids
+                mw.col, rt.conn, blob_store(rt), report.touched_nids
             )
             if (
                 config.media_scan_on_profile_close
                 and baseline.media_baseline_state(rt.conn) == baseline.STATE_DONE
             ):
-                capture_media.full_scan(mw.col, rt.conn, rt.blobs)
+                capture_media.full_scan(mw.col, rt.conn, blob_store(rt))
+        return not report.interrupted
     except Exception as exc:  # must never block shutdown, but leave a trace
         print(f"note_version_history: final scan on close failed: {exc!r}")
+        return False
 
 
 # --- capture hooks ---
@@ -630,7 +708,7 @@ def _start_scan() -> None:
         return  # collection may be mid close/reopen for sync; pending is kept
     if rt.baseline_running:
         return  # a full baseline is running; let it own capture
-    if rt.scan_running:
+    if mutation_busy(rt):
         rt.rescan_requested = True
         return
     if rt.full_rescan_pending:
@@ -647,7 +725,11 @@ def _start_scan() -> None:
     ctx = _build_context(rt, work, config)
     want_notetypes = work.want_notetypes
     db_path = profile_db_path(rt)
+    if not acquire_mutation(rt, "scan"):
+        rt.pending.merge_before(work)
+        return
     rt.scan_running = True
+    rt_token = rt
 
     capture_media_files = consts.MEDIA_ENABLED and config.capture_media
     blobs_root = profiles.blobs_dir(rt.data_dir)
@@ -666,26 +748,32 @@ def _start_scan() -> None:
                     note_report.touched_nids,
                 )
             if prune.maintenance_due(own):
-                prune.run_maintenance(own, BlobStore(blobs_root), config.retention)
+                prune.run_maintenance(
+                    own,
+                    BlobStore(blobs_root) if capture_media_files else None,
+                    config.retention,
+                )
             return note_report
         finally:
             own.close()
 
     def on_success(report) -> None:
-        current = _runtime
-        if current is None:
+        if _runtime is not rt_token:
             return
-        current.scan_running = False
-        current.scan_failures = 0
-        current.session_touched.update(report.touched_nids)
+        rt_token.scan_running = False
+        release_mutation(rt_token, "scan")
+        rt_token.scan_failures = 0
+        rt_token.session_touched.update(report.touched_nids)
         _drain_pending_scan()
 
     def on_failure(exc: BaseException) -> None:
-        current = _runtime
-        if current is not None:
-            current.scan_running = False
-        _note_scan_failure(exc)
-        _drain_pending_scan()
+        if _runtime is not rt_token:
+            return
+        rt_token.scan_running = False
+        release_mutation(rt_token, "scan")
+        rt_token.pending.merge_before(work)
+        _note_scan_failure(exc, rt=rt_token)
+        rt_token.debounce.start(_retry_delay(rt_token.scan_failures))
 
     QueryOp(parent=mw, op=op, success=on_success).failure(on_failure).run_in_background()
 
@@ -707,17 +795,23 @@ def _drain_pending_scan() -> None:
         rt.debounce.start(_RESCAN_DELAY_MS)
 
 
-def _note_scan_failure(exc: BaseException, what: str = "scan") -> None:
+def _note_scan_failure(
+    exc: BaseException, what: str = "scan", rt: Runtime | None = None
+) -> None:
     """Log a background-scan failure and, after several in a row, warn once per
     session so a persistent fault (disk full, locked DB) isn't silent."""
     print(f"note_version_history: {what} failed: {exc!r}")
-    rt = _runtime
-    if rt is None:
+    target = rt if rt is not None else _runtime
+    if target is None:
         return
-    rt.scan_failures += 1
-    if rt.scan_failures >= _MAX_SCAN_FAILURES and not rt.scan_warning_shown:
-        rt.scan_warning_shown = True
+    target.scan_failures += 1
+    if target.scan_failures >= _MAX_SCAN_FAILURES and not target.scan_warning_shown:
+        target.scan_warning_shown = True
         _show_warning(i18n.tr("scan_failed_repeatedly"))
+
+
+def _retry_delay(failures: int) -> int:
+    return retry_delay(failures)
 
 
 def _build_context(rt: Runtime, work: PendingWork, config: AddonConfig) -> NoteScanContext:

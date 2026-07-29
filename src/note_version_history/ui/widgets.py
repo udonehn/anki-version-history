@@ -18,11 +18,12 @@ from ..records import NoteVersion
 _ORIGIN_ICONS = {
     "baseline": "🏁",
     "auto": "⏱️",
-    "manual": "📌",
+    "manual": "📷",
     "restore": "↩️",
 }
 _DELETED_ICON = "🗑️"
 _SYNC_ICON = "🔄"
+_PINNED_ICON = "⭐"
 
 
 def row_icon(version) -> str:
@@ -31,6 +32,8 @@ def row_icon(version) -> str:
     sync) win over the plain origin icon so the icon column is scannable."""
     if version.deleted:
         return _DELETED_ICON
+    if getattr(version, "pinned", False):
+        return _PINNED_ICON
     if version.op_label == consts.LABEL_SYNC:
         return _SYNC_ICON
     return _ORIGIN_ICONS.get(version.origin, "•")
@@ -69,7 +72,9 @@ def format_timestamp(ts_ms: int) -> str:
 
 def timeline_lines(version: NoteVersion) -> tuple[str, str]:
     """(time line, label line) for a note-version timeline row."""
-    label = display_label(version.op_label, version.origin)
+    origin_label = display_label(version.op_label, version.origin)
+    user_label = getattr(version, "user_label", "")
+    label = f"{user_label} · {origin_label}" if user_label else origin_label
     if version.deleted:
         label = f"{label} {tr('ntd_deleted_suffix')}"
     return f"{row_icon(version)} {format_timestamp(version.ts)}", label
@@ -81,6 +86,7 @@ def add_two_line_item(
     line2: str,
     *,
     highlight_red: bool = False,
+    highlight_pinned: bool = False,
 ) -> QListWidgetItem:
     """Append a two-line row rendered by a QLabel widget.
 
@@ -96,6 +102,10 @@ def add_two_line_item(
     label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     if highlight_red:
         label.setStyleSheet("color:#cc3333;")
+    elif highlight_pinned:
+        label.setStyleSheet(
+            "color:#9a7000;font-weight:600;background-color:rgba(255,193,7,0.10);"
+        )
     item.setSizeHint(label.sizeHint())
     list_widget.addItem(item)
     list_widget.setItemWidget(item, label)

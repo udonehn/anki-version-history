@@ -17,8 +17,10 @@ Changes saved here apply immediately — no restart needed.
 - **media_scan_on_profile_close** (default `false`): no effect while media
   capture is disabled.
 - **retention.max_auto_versions_per_note** (default `100`): keep at most this
-  many automatic versions per note; older ones are pruned. Manual snapshots,
-  baseline versions and restore markers are never pruned.
+  many unpinned automatic versions per logical note (GUID); older ones are
+  pruned. Pinned automatic versions are protected. Manual snapshots remain
+  permanent even when unpinned; baseline, restore, and deletion rows are also
+  never pruned.
 - **retention.max_age_days** (default `180`): automatic versions older than
   this are pruned. `0` disables age-based pruning.
 - **retention.media_max_age_days** (default `0`): prune media history older

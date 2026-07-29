@@ -60,6 +60,13 @@ def _setup_tools_menu() -> None:
     qconnect(compact_action.triggered, lambda _checked=False: _compact())
     root.addAction(compact_action)
 
+    connect_action = QAction(tr("menu_connect_history"), mw)
+    qconnect(
+        connect_action.triggered,
+        lambda _checked=False: _connect_existing_history(),
+    )
+    root.addAction(connect_action)
+
     root.addSeparator()
     about_action = QAction(tr("menu_about"), mw)
     qconnect(about_action.triggered, show_about)
@@ -93,23 +100,69 @@ def _compact() -> None:
     if rt is None:
         tooltip(tr("no_profile_open"))
         return
+    if not scheduler.acquire_mutation(rt, "compact"):
+        return
+    rt_token = rt
     db_path = scheduler.profile_db_path(rt)
     blobs_root = profiles.blobs_dir(rt.data_dir)
 
     def op(_col):
         own = db.open_history_db(db_path)
         try:
-            removed = prune.gc_blobs(own, BlobStore(blobs_root))
+            removed = (
+                prune.gc_blobs(own, BlobStore(blobs_root))
+                if consts.MEDIA_ENABLED
+                else 0
+            )
             prune.full_vacuum(own)
             return removed
         finally:
             own.close()
 
+    def on_success(removed: int) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
+        scheduler.release_mutation(rt_token, "compact")
+        tooltip(tr("compact_done", blobs=removed))
+
+    def on_failure(exc: BaseException) -> None:
+        if scheduler.runtime() is rt_token:
+            scheduler.release_mutation(rt_token, "compact")
+            showInfo(str(exc), title=tr("addon_name"))
+
     QueryOp(
         parent=mw,
         op=op,
-        success=lambda removed: tooltip(tr("compact_done", blobs=removed)),
-    ).with_progress(tr("compact_progress")).run_in_background()
+        success=on_success,
+    ).failure(on_failure).with_progress(tr("compact_progress")).run_in_background()
+
+
+def _connect_existing_history() -> None:
+    from .. import profiles
+    from . import dialogs
+
+    rt = scheduler.runtime()
+    profile_prefs = getattr(mw.pm, "profile", None)
+    if rt is None or not isinstance(profile_prefs, dict):
+        tooltip(tr("no_profile_open"))
+        return
+    candidates = [
+        item
+        for item in profiles.discover_histories(scheduler.user_files_dir())
+        if item.storage_key != rt.data_dir.name
+    ]
+    storage_key = dialogs.choose_history(mw, candidates)
+    if storage_key is None:
+        if not candidates:
+            tooltip(tr("connect_history_none"))
+        return
+    profile_prefs[profiles.PROFILE_STORAGE_KEY] = storage_key
+    save_profile = getattr(mw.pm, "save", None)
+    if callable(save_profile):
+        save_profile()
+    scheduler._close_runtime()  # noqa: SLF001 - intentional in-profile reconnect
+    scheduler._on_profile_open()  # noqa: SLF001
+    tooltip(tr("connect_history_done"))
 
 
 def _open_media_history() -> None:
@@ -189,8 +242,22 @@ def _on_browser_context_menu(browser, menu) -> None:
     snapshot_action = menu.addAction(tr("menu_snapshot_selected", count=len(nids)))
     qconnect(
         snapshot_action.triggered,
-        lambda _checked=False, ids=tuple(int(n) for n in nids): actions.snapshot_notes(ids),
+        lambda _checked=False, ids=tuple(int(n) for n in nids): _snapshot_selected(
+            browser, ids
+        ),
     )
+
+
+def _snapshot_selected(parent, nids: tuple[int, ...]) -> None:
+    from . import dialogs
+
+    options = dialogs.edit_annotation(
+        parent, title=tr("snapshot_options"), pinned=True
+    )
+    if options is None:
+        return
+    label, pinned = options
+    actions.snapshot_notes(nids, user_label=label, pinned=pinned)
 
 
 def _on_browser_menus_did_init(browser) -> None:
@@ -280,8 +347,9 @@ def show_about() -> None:
         showInfo(tr("about_no_profile"), title=tr("about_title"))
         return
     db_path = scheduler.profile_db_path(rt)
-    blobs = rt.blobs
+    blobs = scheduler.blob_store(rt) if consts.MEDIA_ENABLED else None
     data_dir = rt.data_dir
+    rt_token = rt
 
     def op(_col):
         # row counts + a full blob-store walk — keep off the main thread
@@ -293,9 +361,11 @@ def show_about() -> None:
             }
         finally:
             own.close()
-        return counts, blobs.stats()
+        return counts, blobs.stats() if blobs is not None else None
 
     def on_success(result) -> None:
+        if scheduler.runtime() is not rt_token:
+            return
         counts, blob_stats = result
         if consts.MEDIA_ENABLED:
             body = tr(

@@ -143,7 +143,7 @@ class MediaHistoryDialog(QDialog):
         rt = scheduler.runtime()
         if rt is None:
             return
-        stats = rt.blobs.stats()
+        stats = scheduler.blob_store(rt).stats()
         events = rt.conn.execute("select count(*) from media_events").fetchone()[0]
         self._stats.setText(
             tr(
@@ -166,11 +166,14 @@ class MediaHistoryDialog(QDialog):
         event = self._events[row]
         if not askUser(tr("md_restore_confirm", fname=fname), parent=self):
             return
+        if not scheduler.acquire_mutation(rt, "media_restore"):
+            return
+        rt_token = rt
         # Background: restoring streams/hashes potentially large files, and the
         # history-DB write may briefly wait on a running scan — neither belongs
         # on the main thread. Own connection, never the main-thread one.
         db_path = scheduler.profile_db_path(rt)
-        blobs = rt.blobs
+        blobs = scheduler.blob_store(rt)
 
         def op(col):
             own = db.open_history_db(db_path)
@@ -180,11 +183,17 @@ class MediaHistoryDialog(QDialog):
                 own.close()
 
         def on_success(_result) -> None:
+            if scheduler.runtime() is not rt_token:
+                return
+            scheduler.release_mutation(rt_token, "media_restore")
             tooltip(tr("md_restore_done"))
             self._reload_files()
             self._update_stats()
 
         def on_failure(exc: BaseException) -> None:
+            if scheduler.runtime() is not rt_token:
+                return
+            scheduler.release_mutation(rt_token, "media_restore")
             if isinstance(exc, (OSError, ValueError, sqlite3.Error)):
                 showWarning(tr("md_restore_failed", error=str(exc)))
             else:

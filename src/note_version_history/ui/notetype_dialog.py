@@ -7,13 +7,16 @@ import json
 
 from aqt import mw
 from aqt.qt import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QPushButton,
     QSplitter,
+    QTimer,
     Qt,
     QTabWidget,
     QVBoxLayout,
@@ -22,12 +25,22 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showWarning, tooltip
 
-from .. import capture_notetypes, diffing, scheduler
+from .. import capture_notetypes, comparison, diffing, scheduler, timeline
 from ..i18n import display_label, tr
 from ..records import NotetypeVersion
-from . import actions, menus, widgets
+from . import actions, dialogs, menus, widgets
 
 _open_dialogs: set["NotetypeHistoryDialog"] = set()
+_FILTER_KEYS = (
+    "all",
+    "automatic",
+    "sync",
+    "snapshot",
+    "restore",
+    "baseline",
+    "deleted",
+    "pinned",
+)
 
 
 def open_dialog(parent=None, preselect_mid: int | None = None) -> None:
@@ -45,6 +58,10 @@ class NotetypeHistoryDialog(QDialog):
         super().__init__(parent)
         self._entries: list[tuple[int, str, bool]] = []  # (mid, name, alive)
         self._versions: list[NotetypeVersion] = []
+        self._offset = 0
+        self._total = 0
+        self._a_id: int | None = None
+        self._b_id: int | None = None
         self.setWindowTitle(tr("ntd_title"))
         self.resize(1000, 660)
         # Opened from the card-type editor (🕘 button): be modal to it so the
@@ -70,22 +87,92 @@ class NotetypeHistoryDialog(QDialog):
         top = QHBoxLayout()
         top.addWidget(QLabel(tr("ntd_pick")))
         self._picker = QComboBox()
-        qconnect(self._picker.currentIndexChanged, lambda _idx: self._reload_timeline())
+        qconnect(
+            self._picker.currentIndexChanged,
+            self._on_picker_changed,
+        )
         top.addWidget(self._picker, 1)
         self._mode = QComboBox()
-        # index 0 = view only (default), 1 = vs current, 2 = vs previous
+        # index 0 = view only, 1 = vs current, 2 = vs previous, 3 = A→B
         self._mode.addItems(
-            [tr("hd_view_only"), tr("ntd_diff_vs_current"), tr("hd_diff_vs_previous")]
+            [
+                tr("hd_view_only"),
+                tr("ntd_diff_vs_current"),
+                tr("hd_diff_vs_previous"),
+                tr("compare_selected_versions"),
+            ]
         )
-        qconnect(self._mode.currentIndexChanged, lambda _idx: self._render())
+        qconnect(self._mode.currentIndexChanged, self._on_mode_changed)
         top.addWidget(self._mode)
+        self._set_a = QPushButton(tr("compare_set_a"))
+        self._set_b = QPushButton(tr("compare_set_b"))
+        self._swap = QPushButton(tr("compare_swap"))
+        self._clear_ab = QPushButton(tr("compare_clear"))
+        qconnect(self._set_a.clicked, lambda: self._set_endpoint("a"))
+        qconnect(self._set_b.clicked, lambda: self._set_endpoint("b"))
+        qconnect(self._swap.clicked, self._swap_endpoints)
+        qconnect(self._clear_ab.clicked, self._clear_endpoints)
+        for button in (self._set_a, self._set_b, self._swap, self._clear_ab):
+            top.addWidget(button)
         root.addLayout(top)
+        self._ab_status = QLabel()
+        self._ab_status.setTextFormat(Qt.TextFormat.PlainText)
+        root.addWidget(self._ab_status)
+        self._update_compare_mode_ui()
+
+        filters = QHBoxLayout()
+        self._search = QLineEdit()
+        self._search.setPlaceholderText(tr("timeline_search"))
+        filters.addWidget(self._search, 1)
+        self._filter = QComboBox()
+        for key in _FILTER_KEYS:
+            self._filter.addItem(tr(f"filter_{key}"), key)
+        filters.addWidget(self._filter)
+        self._content_search = QCheckBox(tr("search_content"))
+        self._pinned_only = QCheckBox(tr("pinned_only"))
+        filters.addWidget(self._content_search)
+        filters.addWidget(self._pinned_only)
+        root.addLayout(filters)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        qconnect(
+            self._search_timer.timeout,
+            lambda: self._reload_timeline(reset_offset=True),
+        )
+        qconnect(self._search.textChanged, lambda _text: self._search_timer.start())
+        qconnect(
+            self._filter.currentIndexChanged,
+            lambda _idx: self._reload_timeline(reset_offset=True),
+        )
+        qconnect(
+            self._content_search.toggled,
+            lambda _checked: self._reload_timeline(reset_offset=True),
+        )
+        qconnect(
+            self._pinned_only.toggled,
+            lambda _checked: self._reload_timeline(reset_offset=True),
+        )
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         self._list = QListWidget()
         self._list.setMinimumWidth(200)  # floor so the timestamp line still fits
         qconnect(self._list.currentRowChanged, lambda _row: self._render())
-        splitter.addWidget(self._list)
+        left_layout.addWidget(self._list, 1)
+        pager = QHBoxLayout()
+        self._previous_page = QPushButton(tr("page_previous"))
+        self._next_page = QPushButton(tr("page_next"))
+        self._range = QLabel()
+        qconnect(self._previous_page.clicked, self._page_back)
+        qconnect(self._next_page.clicked, self._page_forward)
+        pager.addWidget(self._previous_page)
+        pager.addWidget(self._range, 1)
+        pager.addWidget(self._next_page)
+        left_layout.addLayout(pager)
+        splitter.addWidget(left)
 
         self._tabs = QTabWidget()
         splitter.addWidget(self._tabs)
@@ -99,6 +186,9 @@ class NotetypeHistoryDialog(QDialog):
         self._snapshot_button = QPushButton(tr("hd_snapshot_now"))
         qconnect(self._snapshot_button.clicked, self._snapshot_now)
         buttons.addWidget(self._snapshot_button)
+        self._annotate_button = QPushButton(tr("edit_version_metadata"))
+        qconnect(self._annotate_button.clicked, self._edit_annotation)
+        buttons.addWidget(self._annotate_button)
         buttons.addStretch(1)
         self._restore_button = QPushButton(tr("ntd_restore"))
         qconnect(self._restore_button.clicked, self._restore)
@@ -152,17 +242,36 @@ class NotetypeHistoryDialog(QDialog):
             return self._versions[row]
         return None
 
-    def _reload_timeline(self) -> None:
+    def _reload_timeline(
+        self, *, reset_offset: bool = False, select_id: int | None = None
+    ) -> None:
         rt = scheduler.runtime()
         mid = self._current_mid()
+        if reset_offset:
+            self._offset = 0
         self._list.clear()
         self._versions = []
         if rt is None or mid is None:
             self._render()
             return
-        self._versions = capture_notetypes.list_notetype_versions(rt.conn, mid)
-        for version in self._versions:
+        page = capture_notetypes.page_notetype_versions(
+            rt.conn,
+            mid,
+            timeline.TimelineFilter(
+                search=self._search.text(),
+                category=str(self._filter.currentData() or "all"),
+                pinned_only=self._pinned_only.isChecked(),
+                include_content=self._content_search.isChecked(),
+            ),
+            offset=self._offset,
+        )
+        self._versions = list(page.items)
+        self._total = page.total
+        selected_row = 0
+        for index, version in enumerate(self._versions):
             label = display_label(version.op_label, version.origin)
+            if version.user_label:
+                label = f"{version.user_label} · {label}"
             if version.deleted:
                 label = f"{label} {tr('ntd_deleted_suffix')}"
             widgets.add_two_line_item(
@@ -171,15 +280,90 @@ class NotetypeHistoryDialog(QDialog):
                 f"{widgets.row_icon(version)} {widgets.format_timestamp(version.ts)}",
                 label,
                 highlight_red=version.deleted,
+                highlight_pinned=version.pinned,
             )
+            if version.id == select_id:
+                selected_row = index
+        self._range.setText(
+            tr("page_range", start=page.start, end=page.end, total=page.total)
+        )
+        self._previous_page.setEnabled(page.has_previous)
+        self._next_page.setEnabled(page.has_next)
         if self._versions:
-            self._list.setCurrentRow(0)
+            self._list.setCurrentRow(selected_row)
         else:
             self._render()
+        self._update_ab_status()
+
+    def _page_back(self) -> None:
+        self._offset = max(0, self._offset - timeline.PAGE_SIZE)
+        self._reload_timeline()
+
+    def _page_forward(self) -> None:
+        if self._offset + timeline.PAGE_SIZE < self._total:
+            self._offset += timeline.PAGE_SIZE
+            self._reload_timeline()
+
+    def _on_picker_changed(self, _index: int) -> None:
+        self._a_id = self._b_id = None
+        self._update_ab_status()
+        self._reload_timeline(reset_offset=True)
+
+    def _on_mode_changed(self, _index: int) -> None:
+        self._update_compare_mode_ui()
+        self._render()
+
+    def _update_compare_mode_ui(self) -> None:
+        visible = self._mode.currentIndex() == 3
+        for button in (self._set_a, self._set_b, self._swap, self._clear_ab):
+            button.setVisible(visible)
+        self._ab_status.setVisible(visible)
+
+    def _endpoint(self, version_id: int | None) -> NotetypeVersion | None:
+        rt = scheduler.runtime()
+        return (
+            capture_notetypes.get_notetype_version(rt.conn, version_id)
+            if rt is not None and version_id is not None
+            else None
+        )
+
+    def _set_endpoint(self, endpoint: str) -> None:
+        version = self._current_version()
+        if version is None or version.id is None:
+            return
+        if endpoint == "a":
+            self._a_id = version.id
+        else:
+            self._b_id = version.id
+        self._update_ab_status()
+        self._render()
+
+    def _swap_endpoints(self) -> None:
+        self._a_id, self._b_id = self._b_id, self._a_id
+        self._update_ab_status()
+        self._render()
+
+    def _clear_endpoints(self) -> None:
+        self._a_id = self._b_id = None
+        self._update_ab_status()
+        self._render()
+
+    def _update_ab_status(self) -> None:
+        a = self._endpoint(self._a_id)
+        b = self._endpoint(self._b_id)
+        self._ab_status.setText(
+            tr(
+                "compare_status",
+                a=_version_short(a),
+                b=_version_short(b),
+            )
+        )
+        self._swap.setEnabled(a is not None or b is not None)
+        self._clear_ab.setEnabled(a is not None or b is not None)
 
     # --- rendering ---
 
-    def _base_config(self) -> dict:
+    def _base_config(self, target: NotetypeVersion) -> dict:
         """What diffs compare against: the live notetype or the previous
         version. View-only mode never calls this."""
         if self._mode.currentIndex() == 1:  # vs current
@@ -195,26 +379,42 @@ class NotetypeHistoryDialog(QDialog):
                 return editing
             live = mw.col.models.get(mid) if mw.col is not None else None
             return live or {}
-        row = self._list.currentRow()  # vs previous
-        if 0 <= row < len(self._versions) - 1:
-            previous = self._versions[row + 1]
-            if not previous.deleted and previous.config_json:
-                try:
-                    return json.loads(previous.config_json)
-                except json.JSONDecodeError:
-                    return {}
+        rt = scheduler.runtime()
+        previous = (
+            capture_notetypes.get_previous_notetype_version(rt.conn, target.id)
+            if rt is not None and target.id is not None
+            else None
+        )
+        if previous is not None and not previous.deleted and previous.config_json:
+            try:
+                return json.loads(previous.config_json)
+            except json.JSONDecodeError:
+                return {}
         return {}
 
     def _render(self) -> None:
         self._tabs.clear()
-        version = self._current_version()
+        explicit_mode = self._mode.currentIndex() == 3
+        endpoint_a = self._endpoint(self._a_id) if explicit_mode else None
+        endpoint_b = self._endpoint(self._b_id) if explicit_mode else None
+        explicit_ab = (
+            explicit_mode and endpoint_a is not None and endpoint_b is not None
+        )
+        if explicit_mode and not explicit_ab:
+            self._tabs.addTab(QLabel(tr("compare_select_both")), "A→B")
+            self._restore_button.setEnabled(False)
+            self._annotate_button.setEnabled(self._current_version() is not None)
+            return
+        version = endpoint_b if explicit_ab else self._current_version()
         if version is None:
             self._tabs.addTab(QLabel(tr("ntd_no_versions")), "—")
             self._restore_button.setEnabled(False)
+            self._annotate_button.setEnabled(False)
             return
+        self._annotate_button.setEnabled(self._current_version() is not None)
         mid = self._current_mid()
         live_exists = bool(mw.col and mid is not None and mw.col.models.get(mid))
-        if version.deleted or not version.config_json:
+        if (version.deleted or not version.config_json) and not explicit_ab:
             banner = QLabel(tr("ntd_deleted_banner"))
             banner.setStyleSheet("color:#cc3333;font-weight:bold;padding:12px;")
             self._tabs.addTab(banner, "—")
@@ -222,19 +422,31 @@ class NotetypeHistoryDialog(QDialog):
             return
         self._restore_button.setEnabled(live_exists)
 
-        try:
-            config = json.loads(version.config_json)
-        except json.JSONDecodeError:
-            self._tabs.addTab(QLabel(tr("restore_failed", error="bad JSON")), "—")
-            return
-        view_only = self._mode.currentIndex() == 0
-        base = {} if view_only else self._base_config()
-        base_templates = {t.get("name", ""): t for t in base.get("tmpls", [])}
+        view_only = self._mode.currentIndex() == 0 and not explicit_ab
+        if explicit_ab:
+            surface = comparison.compare_notetypes(endpoint_a, version)
+            base = {"css": surface.a_css}
+            config = {"css": surface.b_css}
+            base_templates = surface.a_templates
+            target_templates = surface.b_templates
+            template_names = list(surface.template_names)
+        else:
+            config = _version_config(version)
+            base = {} if view_only else self._base_config(version)
+            base_templates = {
+                t.get("name", ""): t for t in base.get("tmpls", [])
+            }
+            target_templates = {
+                t.get("name", ""): t for t in config.get("tmpls", [])
+            }
+            template_names = list(
+                dict.fromkeys((*base_templates.keys(), *target_templates.keys()))
+            )
         insert_style, delete_style = widgets.diff_styles()
         label = widgets.format_timestamp(version.ts)
 
-        for template in config.get("tmpls", []):
-            name = template.get("name", "?")
+        for name in template_names:
+            template = target_templates.get(name, {})
             base_template = base_templates.get(name, {})
             tab = QWidget()
             layout = QVBoxLayout(tab)
@@ -298,5 +510,50 @@ class NotetypeHistoryDialog(QDialog):
         mid = self._current_mid()
         if mid is None:
             return
-        actions.snapshot_notetype(mid)
-        self._reload_timeline()
+        options = dialogs.edit_annotation(
+            self, title=tr("snapshot_options"), pinned=True
+        )
+        if options is None:
+            return
+        label, pinned = options
+        actions.snapshot_notetype(
+            mid,
+            user_label=label,
+            pinned=pinned,
+            on_done=lambda: self._reload_timeline(reset_offset=True),
+        )
+
+    def _edit_annotation(self) -> None:
+        version = self._current_version()
+        rt = scheduler.runtime()
+        if version is None or version.id is None or rt is None:
+            return
+        options = dialogs.edit_annotation(
+            self,
+            title=tr("edit_version_metadata"),
+            user_label=version.user_label,
+            pinned=version.pinned,
+        )
+        if options is None:
+            return
+        label, pinned = options
+        capture_notetypes.update_notetype_annotation(
+            rt.conn, version.id, user_label=label, pinned=pinned
+        )
+        self._reload_timeline(select_id=version.id)
+
+
+def _version_config(version: NotetypeVersion | None) -> dict:
+    if version is None or version.deleted or not version.config_json:
+        return {}
+    try:
+        value = json.loads(version.config_json)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _version_short(version: NotetypeVersion | None) -> str:
+    if version is None:
+        return "—"
+    return version.user_label or widgets.format_timestamp(version.ts)

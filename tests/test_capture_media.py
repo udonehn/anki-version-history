@@ -163,6 +163,25 @@ def test_restore_media_file_round_trip(col, conn, blobs):
     assert blobs.has(v2_sha)
 
 
+def test_restore_media_db_failure_restores_original_file(col, conn, blobs):
+    write_media(col, "atomic.mp3", b"v1")
+    full_scan(col, conn, blobs)
+    v1_sha = list_media_events(conn, "atomic.mp3")[0].sha1
+    write_media(col, "atomic.mp3", b"v2")
+    full_scan(col, conn, blobs)
+    before_events = len(list_media_events(conn, "atomic.mp3"))
+    conn.execute(
+        "CREATE TRIGGER fail_restore_manifest BEFORE UPDATE ON media_manifest "
+        "WHEN NEW.fname='atomic.mp3' BEGIN SELECT RAISE(FAIL,'boom'); END"
+    )
+
+    with pytest.raises(Exception, match="boom"):
+        restore_media_file(col, conn, blobs, "atomic.mp3", v1_sha)
+
+    assert (media_dir(col) / "atomic.mp3").read_bytes() == b"v2"
+    assert len(list_media_events(conn, "atomic.mp3")) == before_events
+
+
 def test_restore_recreates_deleted_file(col, conn, blobs):
     write_media(col, "gone.png", b"bytes")
     full_scan(col, conn, blobs)

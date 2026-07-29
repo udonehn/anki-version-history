@@ -19,6 +19,11 @@ def test_english_lookup():
 def test_korean_lookup():
     i18n.set_language("ko")
     assert i18n.tr("menu_root") == "노트 버전 기록"
+    assert i18n.tr("edit_version_metadata") == "버전 정보 수정…"
+    assert i18n.tr("compare_selected_versions") == "지정한 두 버전 비교 (A→B)"
+    assert i18n.tr("menu_full_rescan") == "기록 누락 검사·복구…"
+    assert i18n.tr("menu_compact") == "DB 여유 공간 회수…"
+    assert i18n.tr("menu_connect_history") == "이전 프로필 기록 다시 연결…"
 
 
 def test_missing_key_returns_key():
@@ -62,6 +67,35 @@ def test_resolve_language():
 def test_set_language_rejects_unknown():
     i18n.set_language("xx")
     assert i18n.current_language() == "en"
+
+
+def test_baseline_first_run_intro_formats():
+    # tr() swallows format errors (returns the raw template), so a placeholder
+    # typo in either language would otherwise ship silently
+    for lang in ("en", "ko"):
+        i18n.set_language(lang)
+        text = i18n.tr(
+            "baseline_first_run_intro",
+            addon_name=i18n.tr("menu_root"),
+            notes=1234,
+            notetypes=5,
+            mb=1.25,
+        )
+        assert "1234" in text
+        assert "{" not in text
+
+    i18n.set_language("ko")
+    assert i18n.tr("baseline_intro_title") == "노트 버전 기록 — 베이스라인 생성"
+    assert i18n.tr(
+        "baseline_first_run_intro",
+        addon_name=i18n.tr("menu_root"),
+        notes=1234,
+        notetypes=5,
+        mb=1.25,
+    ).startswith(
+        "노트 버전 기록 애드온이 설치되었습니다!\n"
+        "이제부터 노트를 편집할 때마다 변경 이력이 자동으로 저장됩니다."
+    )
 
 
 def test_en_ko_key_parity():

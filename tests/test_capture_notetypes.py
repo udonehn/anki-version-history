@@ -103,11 +103,20 @@ def test_manual_snapshot_bypasses_dedupe(col, conn):
     scan_notetypes(col, conn, origin=consts.ORIGIN_BASELINE)
     mid = basic_mid(col)
 
-    assert snapshot_notetype(col, conn, mid, op_label="Manual") is True
+    assert snapshot_notetype(
+        col,
+        conn,
+        mid,
+        op_label="Manual",
+        user_label="Important schema",
+        pinned=True,
+    ) is True
     assert snapshot_notetype(col, conn, mid, op_label="Manual") is True
 
     versions = list_notetype_versions(conn, mid)
     assert len(versions) == 3  # baseline + two identical manual snapshots
+    assert versions[1].user_label == "Important schema"
+    assert versions[1].pinned
     assert versions[0].origin == consts.ORIGIN_MANUAL
 
 

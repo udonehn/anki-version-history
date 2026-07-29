@@ -115,6 +115,19 @@ def test_guid_mismatch_blocks_in_place_restore(col, conn):
         restore.apply_note_version(col, tampered, None, "Restore")
 
 
+def test_restore_resolves_live_note_by_guid_after_nid_move(col, conn):
+    note = add_note(col, front="old")
+    baseline.run_notes_baseline(col, conn)
+    version = list_note_versions(conn, note.id)[0]
+    moved_nid = int(note.id) + 10_000
+    col.db.execute("update notes set id=?, flds=? where id=?", moved_nid, "new\x1fb", note.id)
+    col.db.execute("update cards set nid=? where nid=?", moved_nid, note.id)
+
+    restore.apply_note_version(col, version, None, "Restore")
+
+    assert col.get_note(moved_nid)["Front"] == "old"
+
+
 def test_restore_deleted_note_as_new(col, conn):
     note = add_note(col, front="precious", back="content", tags=("keep",))
     baseline.run_notes_baseline(col, conn)

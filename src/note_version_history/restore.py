@@ -58,10 +58,16 @@ def apply_note_version(
 ) -> NoteRestoreResult:
     """Overwrite the live note's fields (matched BY NAME, so field renames
     don't scramble content) and, on whole-version restore, its tags."""
-    note = col.get_note(version.nid)  # NotFoundError → caller offers restore-as-new
+    live_nid = find_live_note_nid(col, version)
+    if live_nid is None:
+        # Preserve Anki's NotFoundError for the restore-as-new UI. If the nid
+        # was reused, this fetch succeeds and the GUID guard below reports the
+        # safer, more specific mismatch.
+        live_nid = version.nid
+    note = col.get_note(live_nid)
     if version.guid and note.guid != version.guid:
         raise GuidMismatchError(
-            f"note {version.nid}: live guid {note.guid!r} != version guid {version.guid!r}"
+            f"note {live_nid}: live guid {note.guid!r} != version guid {version.guid!r}"
         )
     current_names = set(note.keys())
     undo_pos = col.add_custom_undo_entry(undo_name)
@@ -86,6 +92,15 @@ def apply_note_version(
     return NoteRestoreResult(
         changes=changes, applied_fields=tuple(applied), skipped_fields=tuple(skipped)
     )
+
+
+def find_live_note_nid(col: Collection, version: NoteVersion) -> int | None:
+    """Resolve a stored note by GUID; nid is only a legacy/location fallback."""
+    if version.guid:
+        nid = col.db.scalar("select id from notes where guid=? limit 1", version.guid)
+        return int(nid) if nid is not None else None
+    exists = col.db.scalar("select 1 from notes where id=?", version.nid)
+    return int(version.nid) if exists is not None else None
 
 
 def restore_deleted_note_as_new(

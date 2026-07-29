@@ -4,6 +4,10 @@ every later edit has a "previous version" to restore.
 Resumable: the cursor (last processed nid) is committed with each chunk, so
 an interrupted baseline continues where it left off. Media baseline is a
 separate flow (media milestone) tracked in the same state dict.
+
+Both ``notes`` and ``media`` move pending → done, or to skipped when the user
+declines the corresponding offer. Skipped only suppresses automatic offers —
+a manual Tools-menu run still works, and completion overwrites it with done.
 """
 
 from __future__ import annotations
@@ -50,6 +54,21 @@ def update_state(conn: sqlite3.Connection, **changes: object) -> dict:
 
 def notes_baseline_done(conn: sqlite3.Connection) -> bool:
     return get_state(conn)["notes"] == STATE_DONE
+
+
+def skip_notes_baseline(conn: sqlite3.Connection) -> None:
+    """Record a declined first-run offer so profile open never auto-asks again.
+    A completed baseline is never demoted to skipped — the rescan/heal paths
+    are gated on done."""
+    if get_state(conn)["notes"] != STATE_DONE:
+        update_state(conn, notes=STATE_SKIPPED)
+
+
+def should_offer_first_run(conn: sqlite3.Connection) -> bool:
+    """Profile-open one-time offer gate: the notes baseline was neither
+    completed nor explicitly declined. Compares == pending (not "not done")
+    so unknown future states fail closed. The Tools menu bypasses this gate."""
+    return get_state(conn)["notes"] == STATE_PENDING
 
 
 def estimate(col: Collection) -> dict:
@@ -138,7 +157,8 @@ def _process_chunk(
     try:
         for rs in read_states:
             already_indexed = conn.execute(
-                "select 1 from note_index where nid=?", (rs.nid,)
+                "select 1 from note_index where identity=?",
+                (db.note_identity(rs.nid, rs.guid),),
             ).fetchone()
             if already_indexed is None:
                 if write_note_state(conn, rs, ctx, now_ms, force=False):
@@ -157,9 +177,9 @@ def _finalize(col: Collection, conn: sqlite3.Connection, total: int) -> None:
     """Mark done and initialize the scan marker/count so auto-capture takes
     over exactly where the baseline left off."""
     max_mod = int(col.db.scalar("select coalesce(max(mod), 0) from notes"))
-    current_marker = db.meta_get_int(conn, consts.META_NOTE_SCAN_MARKER, 0)
-    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max(max_mod, current_marker)))
+    db.meta_set(conn, consts.META_NOTE_SCAN_MARKER, str(max_mod))
     db.meta_set(conn, consts.META_LAST_NOTE_COUNT, str(total))
+    conn.execute("DELETE FROM note_scan_boundary")
     update_state(conn, notes=STATE_DONE)
 
 
