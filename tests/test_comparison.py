@@ -53,3 +53,62 @@ def test_notetype_compare_uses_template_union_css_and_empty_deleted_state():
     deleted = comparison.compare_notetypes(a, _notetype("", deleted=True))
     assert deleted.b_templates == {}
     assert deleted.b_css == ""
+
+
+def test_note_action_target_is_the_rendered_b_endpoint_in_explicit_mode():
+    current = _note(fields=("selected",))
+    endpoint_a = _note(fields=("before",))
+    endpoint_b = _note(fields=("rendered B",))
+
+    assert (
+        comparison.action_target(
+            current,
+            explicit_mode=False,
+            endpoint_a=endpoint_a,
+            endpoint_b=endpoint_b,
+        )
+        is current
+    )
+    assert (
+        comparison.action_target(
+            current,
+            explicit_mode=True,
+            endpoint_a=endpoint_a,
+            endpoint_b=endpoint_b,
+        )
+        is endpoint_b
+    )
+    assert (
+        comparison.action_target(
+            current,
+            explicit_mode=True,
+            endpoint_a=None,
+            endpoint_b=endpoint_b,
+        )
+        is None
+    )
+
+
+def test_notetype_action_target_is_the_rendered_b_endpoint_in_explicit_mode():
+    current = _notetype('{"css":"selected"}')
+    endpoint_a = _notetype('{"css":"before"}')
+    endpoint_b = _notetype('{"css":"rendered B"}')
+
+    assert (
+        comparison.action_target(
+            current,
+            explicit_mode=True,
+            endpoint_a=endpoint_a,
+            endpoint_b=endpoint_b,
+        )
+        is endpoint_b
+    )
+    assert (
+        comparison.action_target(
+            current,
+            explicit_mode=True,
+            endpoint_a=endpoint_a,
+            endpoint_b=None,
+        )
+        is None
+    )

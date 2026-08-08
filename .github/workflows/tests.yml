@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Anki 23.10 / Python 3.9
+            os: ubuntu-latest
+            python: "3.9"
+            anki: "23.10"
+            aqt_extra: "qt6"
+          - name: Anki 26.05 / Python 3.13 / Windows
+            os: windows-latest
+            python: "3.13"
+            anki: "26.5"
+            aqt_extra: "qt"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install test tools and Anki
+        run: >-
+          python -m pip install
+          "anki==${{ matrix.anki }}"
+          "aqt[${{ matrix.aqt_extra }}]==${{ matrix.anki }}"
+          "pytest==8.4.2"
+          "pytest-cov==7.1.0"
+          "ruff==0.15.22"
+      - name: Compile add-on
+        run: python -m compileall -q src/note_version_history tests
+      - name: Lint
+        run: python -m ruff check .
+      - name: Smoke-test supported aqt APIs
+        run: python tests/smoke_aqt.py
+      - name: Test
+        run: python -m pytest -q

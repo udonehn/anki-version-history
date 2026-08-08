@@ -361,6 +361,15 @@ class NotetypeHistoryDialog(QDialog):
         self._swap.setEnabled(a is not None or b is not None)
         self._clear_ab.setEnabled(a is not None or b is not None)
 
+    def _restore_target(self) -> NotetypeVersion | None:
+        explicit_mode = self._mode.currentIndex() == 3
+        return comparison.action_target(
+            self._current_version(),
+            explicit_mode=explicit_mode,
+            endpoint_a=self._endpoint(self._a_id) if explicit_mode else None,
+            endpoint_b=self._endpoint(self._b_id) if explicit_mode else None,
+        )
+
     # --- rendering ---
 
     def _base_config(self, target: NotetypeVersion) -> dict:
@@ -405,7 +414,12 @@ class NotetypeHistoryDialog(QDialog):
             self._restore_button.setEnabled(False)
             self._annotate_button.setEnabled(self._current_version() is not None)
             return
-        version = endpoint_b if explicit_ab else self._current_version()
+        version = comparison.action_target(
+            self._current_version(),
+            explicit_mode=explicit_mode,
+            endpoint_a=endpoint_a,
+            endpoint_b=endpoint_b,
+        )
         if version is None:
             self._tabs.addTab(QLabel(tr("ntd_no_versions")), "—")
             self._restore_button.setEnabled(False)
@@ -420,7 +434,9 @@ class NotetypeHistoryDialog(QDialog):
             self._tabs.addTab(banner, "—")
             self._restore_button.setEnabled(False)
             return
-        self._restore_button.setEnabled(live_exists)
+        self._restore_button.setEnabled(
+            live_exists and not version.deleted and bool(version.config_json)
+        )
 
         view_only = self._mode.currentIndex() == 0 and not explicit_ab
         if explicit_ab:
@@ -486,7 +502,7 @@ class NotetypeHistoryDialog(QDialog):
     # --- actions ---
 
     def _restore(self) -> None:
-        version = self._current_version()
+        version = self._restore_target()
         if version is None or version.deleted or not version.config_json:
             return
         when = widgets.format_timestamp(version.ts)

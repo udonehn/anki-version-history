@@ -334,6 +334,15 @@ class HistoryDialog(QDialog):
             return previous, target, False
         return None, target, False
 
+    def _restore_target(self) -> NoteVersion | None:
+        base_version, target, explicit_mode = self._comparison()
+        return comparison.action_target(
+            self._current_version(),
+            explicit_mode=explicit_mode,
+            endpoint_a=base_version,
+            endpoint_b=target,
+        )
+
     def _render(self) -> None:
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -440,7 +449,7 @@ class HistoryDialog(QDialog):
         layout.addWidget(tags)
 
     def _restore_version(self) -> None:
-        version = self._current_version()
+        version = self._restore_target()
         if version is None:
             return
         if version.deleted or self._live_note(version) is None:
@@ -453,7 +462,7 @@ class HistoryDialog(QDialog):
             actions.restore_note_version(self, version, None, self._reload)
 
     def _restore_fields(self) -> None:
-        version = self._current_version()
+        version = self._restore_target()
         if version is None or version.deleted:
             return
         names = {

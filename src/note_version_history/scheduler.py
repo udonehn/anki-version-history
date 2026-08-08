@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import current_thread, main_thread
 
 from aqt import gui_hooks, mw
 from aqt.operations import QueryOp
@@ -40,6 +42,7 @@ from . import (
 from .appconfig import AddonConfig, config_from_dict
 from .blobstore import BlobStore
 from .capture_notes import NoteScanContext
+from .install_lifecycle import run_on_owner_thread_sync
 from .workqueue import PendingWork, heal_scope, retry_delay, shutdown_can_be_clean
 
 _RESCAN_DELAY_MS = 200
@@ -53,6 +56,7 @@ _MAX_SCAN_FAILURES = 3
 _PROFILE_OPEN_PROMPT_DELAY_MS = 4_000
 _PROFILE_OPEN_PROMPT_RETRY_MS = 5_000
 _PROFILE_OPEN_PROMPT_MAX_RETRIES = 6
+_INSTALL_TEARDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -88,6 +92,7 @@ class Runtime:
 
 
 _runtime: Runtime | None = None
+_update_started = False
 
 
 def runtime() -> Runtime | None:
@@ -154,7 +159,13 @@ def _on_config_updated(_new_config: object) -> None:
         return
     config = load_config()
     rt.heartbeat.stop()
-    if config.heartbeat_scan_minutes > 0 and not rt.sync_active:
+    if not config.auto_capture:
+        rt.debounce.stop()
+    if (
+        config.auto_capture
+        and config.heartbeat_scan_minutes > 0
+        and not rt.sync_active
+    ):
         rt.heartbeat.start(config.heartbeat_scan_minutes * 60_000)
 
 
@@ -173,7 +184,66 @@ def setup() -> None:
     gui_hooks.sync_will_start.append(_on_sync_will_start)
     gui_hooks.sync_did_finish.append(_on_sync_did_finish)
     gui_hooks.collection_will_temporarily_close.append(_on_collection_will_temporarily_close)
+    install_hook = getattr(gui_hooks, "addon_manager_will_install_addon", None)
+    if install_hook is not None:
+        install_hook.append(_on_addon_manager_will_install)
+    delete_hook = getattr(gui_hooks, "addons_dialog_will_delete_addons", None)
+    if delete_hook is not None:
+        delete_hook.append(_on_addons_will_delete)
     mw.addonManager.setConfigUpdatedAction(__name__, _on_config_updated)
+
+
+def _on_addon_manager_will_install(manager, module: str) -> None:
+    """Release every handle before Anki moves ``user_files`` out of the way.
+
+    AnkiWeb updates invoke this hook on the serialized collection worker;
+    local ``.ankiaddon`` installs invoke it synchronously on the Qt main
+    thread. The persistent connection and timers belong to the main thread,
+    so the worker path must hand off and wait for completion.
+    """
+    if module != manager.addonFromModule(__name__):
+        return
+    on_main = current_thread() is main_thread()
+    run_on_owner_thread_sync(
+        _prepare_for_install_on_main,
+        mw.taskman.run_on_main,
+        already_on_owner=on_main,
+        timeout_seconds=_INSTALL_TEARDOWN_TIMEOUT_SECONDS,
+    )
+    if on_main:
+        _drain_collection_executor()
+
+
+def _on_addons_will_delete(_dialog, modules: list[str]) -> None:
+    """Make removal from Anki's add-on dialog safe on Windows as well."""
+    if mw.addonManager.addonFromModule(__name__) not in modules:
+        return
+    _prepare_for_install_on_main()
+    _drain_collection_executor()
+
+
+def _prepare_for_install_on_main() -> None:
+    """Pause the old in-memory code until Anki is restarted after install."""
+    global _update_started
+    _update_started = True
+    _close_runtime(for_update=True)
+
+
+def _drain_collection_executor() -> None:
+    """Wait for local-install QueryOps to close their short-lived DB handles.
+
+    This is only called from the main-thread local install/delete paths. An
+    AnkiWeb installer already occupies the same single-worker executor, where
+    submitting and waiting for this barrier would deadlock.
+    """
+    barrier = mw.taskman.run_in_background(lambda: None)
+    try:
+        barrier.result(timeout=_INSTALL_TEARDOWN_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        raise RuntimeError(
+            "timed out waiting for version-history background work; "
+            "refusing to continue installation"
+        ) from exc
 
 
 def request_scan(*, notes: bool = False, notetypes: bool = False, delay_ms: int = 300) -> None:
@@ -313,6 +383,8 @@ def request_media_scan(on_done=None) -> bool:
 
 def _on_profile_open() -> None:
     global _runtime
+    if _update_started:
+        return
     if _runtime is not None:
         _close_runtime()  # defensive: profile switch without close event
     config = load_config()
@@ -371,7 +443,7 @@ def _on_profile_open() -> None:
     _runtime.prev_undo_status = _safe_undo_status()
     unclean_heal = heal_scope(unclean, baseline.notes_baseline_done(conn))
 
-    if config.heartbeat_scan_minutes > 0:
+    if config.auto_capture and config.heartbeat_scan_minutes > 0:
         heartbeat.start(config.heartbeat_scan_minutes * 60_000)
 
     # Lazy-baseline model: never capture the existing collection up front. A
@@ -380,16 +452,19 @@ def _on_profile_open() -> None:
     # cache. Later opens do a catch-up scan for changes made while away. A
     # one-time full-baseline offer is scheduled at the end of this function.
     if fresh and mw.col is not None:
-        _init_lazy_install(_runtime.conn)
-    elif unclean_heal is not None:
+        _init_lazy_install(
+            _runtime.conn, capture_notetype_baseline=config.auto_capture
+        )
+    elif config.auto_capture and unclean_heal is not None:
         # A previous session died mid-flight: the full rescan hash-compares
         # everything and resets the marker, subsuming the catch-up scan — so
         # schedule ONLY it (both on the same connection would otherwise race).
         QTimer.singleShot(3_000, lambda: request_full_rescan())
-    else:
+    elif config.auto_capture:
         request_scan(notes=True, notetypes=True, delay_ms=_INITIAL_SCAN_DELAY_MS)
     if (
-        config.capture_media
+        config.auto_capture
+        and config.capture_media
         and config.media_scan_on_profile_open
         and baseline.media_baseline_state(_runtime.conn) == baseline.STATE_DONE
         and _media_scan_stale(_runtime.conn)
@@ -441,12 +516,16 @@ def _maybe_profile_open_prompt(rt_token: Runtime, attempt: int = 0) -> None:
     baseline_wizard.maybe_profile_open_prompt()
 
 
-def _init_lazy_install(conn: sqlite3.Connection) -> None:
+def _init_lazy_install(
+    conn: sqlite3.Connection, *, capture_notetype_baseline: bool = True
+) -> None:
     """Fresh DB: set the notes capture start point to 'now' so the pre-existing
     collection isn't captured wholesale (only notes edited from here on get a
-    baseline, via the editor-load cache). Note types are few, so baseline them
-    outright for full template/CSS coverage."""
+    baseline, via the editor-load cache). When automatic capture is enabled,
+    the few note types are baselined outright for template/CSS coverage."""
     capture_notes.initialize_lazy_boundary(mw.col, conn)
+    if not capture_notetype_baseline:
+        return
     try:
         capture_notetypes.scan_notetypes(
             mw.col, conn, origin=consts.ORIGIN_BASELINE, op_label=""
@@ -459,7 +538,7 @@ def _on_profile_close() -> None:
     _close_runtime()
 
 
-def _close_runtime() -> None:
+def _close_runtime(*, for_update: bool = False) -> None:
     global _runtime
     rt = _runtime
     if rt is None:
@@ -469,7 +548,12 @@ def _close_runtime() -> None:
         rt.debounce.stop()
         rt.heartbeat.stop()
         final_succeeded = False
-        if not mutation_busy(rt) and not rt.sync_active and not rt.full_rescan_pending:
+        if (
+            not for_update
+            and not mutation_busy(rt)
+            and not rt.sync_active
+            and not rt.full_rescan_pending
+        ):
             final_succeeded = _final_scan_on_close(rt)
         clean = shutdown_can_be_clean(
             mutation_busy=mutation_busy(rt),
@@ -485,8 +569,10 @@ def _close_runtime() -> None:
         try:
             rt.conn.close()
         except sqlite3.Error:
-            pass
-        _runtime = None
+            if for_update:
+                raise
+        finally:
+            _runtime = None
 
 
 def _final_scan_on_close(rt: Runtime) -> bool:
@@ -639,7 +725,7 @@ def _on_sync_did_finish() -> None:
         return
     rt.sync_active = False
     config = load_config()
-    if config.heartbeat_scan_minutes > 0:
+    if config.auto_capture and config.heartbeat_scan_minutes > 0:
         rt.heartbeat.start(config.heartbeat_scan_minutes * 60_000)
     full_sync = rt.full_sync_seen
     rt.full_sync_seen = False
@@ -719,6 +805,8 @@ def _start_scan() -> None:
         request_full_rescan(done)
         return
     config = load_config()
+    if not config.auto_capture:
+        return
     work = rt.pending.consume()
     if not (work.want_notes or work.want_notetypes):
         return

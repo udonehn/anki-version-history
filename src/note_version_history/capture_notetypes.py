@@ -186,18 +186,13 @@ def page_notetype_versions(
     if filter_.pinned_only:
         clauses.append("pinned=1")
     if filter_.search:
-        pattern = timeline.like_pattern(filter_.search.casefold())
-        searchable = [
-            "lower(user_label) LIKE ? ESCAPE '\\'",
-            "lower(op_label) LIKE ? ESCAPE '\\'",
-            "lower(origin) LIKE ? ESCAPE '\\'",
-            "lower(name) LIKE ? ESCAPE '\\'",
-        ]
-        search_params: list[object] = [pattern] * len(searchable)
+        searchable = ["user_label", "op_label", "origin", "name"]
         if filter_.include_content:
-            searchable.append("lower(config) LIKE ? ESCAPE '\\'")
-            search_params.append(pattern)
-        clauses.append("(" + " OR ".join(searchable) + ")")
+            searchable.append("config")
+        search_clause, search_params = timeline.text_search_clause(
+            filter_.search, tuple(searchable), deleted_column="deleted"
+        )
+        clauses.append(search_clause)
         params.extend(search_params)
     where = " AND ".join(clauses)
     total = int(

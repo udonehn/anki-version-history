@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import TypeVar
 
 from .records import NotetypeVersion, NoteVersion
+
+VersionT = TypeVar("VersionT")
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,24 @@ class NotetypeComparison:
     b_templates: dict[str, dict]
     a_css: str
     b_css: str
+
+
+def action_target(
+    current: VersionT | None,
+    *,
+    explicit_mode: bool,
+    endpoint_a: VersionT | None,
+    endpoint_b: VersionT | None,
+) -> VersionT | None:
+    """Return the version represented by an action on the rendered surface.
+
+    In A→B mode the right-hand surface is B, even when another timeline row
+    remains selected.  Requiring both endpoints also makes a stale button event
+    harmless while the comparison is incomplete.
+    """
+    if not explicit_mode:
+        return current
+    return endpoint_b if endpoint_a is not None and endpoint_b is not None else None
 
 
 def compare_notes(

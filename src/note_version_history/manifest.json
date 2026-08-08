@@ -2,6 +2,6 @@
     "package": "note_version_history",
     "name": "Version History - Notes and Note Types",
     "min_point_version": 231000,
-    "human_version": "1.2.0",
+    "human_version": "1.2.1",
     "homepage": "https://github.com/udonehn/anki-version-history"
 }

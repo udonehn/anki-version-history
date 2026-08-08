@@ -1,7 +1,6 @@
-"""Version History — Notes, Note Types & Media.
+"""Local version history for Anki notes and note types (templates/CSS).
 
-Git-like, append-only version history for Anki notes, note types
-(templates/CSS) and media, with in-app timeline, diff and restore.
+Provides in-app timelines, diffs, snapshots, and compatible-content restore.
 
 This entry point only wires hooks; everything heavy loads lazily. The
 package also imports cleanly outside Anki (headless tests import submodules

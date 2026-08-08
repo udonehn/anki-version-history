@@ -1,11 +1,16 @@
 [project]
 name = "note-version-history"
-version = "1.2.0"
-description = "Anki add-on: git-like version history for notes, note types (templates/CSS) and media"
-requires-python = ">=3.10"
+version = "1.2.1"
+description = "Local version history for Anki notes and note types (templates/CSS)"
+requires-python = ">=3.9"
 
 [project.optional-dependencies]
-dev = ["anki", "pytest", "pytest-cov", "ruff"]
+dev = [
+    "anki>=23.10",
+    "pytest==8.4.2",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.22",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -24,4 +29,4 @@ show_missing = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py39"
